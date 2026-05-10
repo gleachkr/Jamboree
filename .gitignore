@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+.vite
+.turbo
+*.tsbuildinfo
+
+.DS_Store
+*.log
+npm-debug.log*
+
+.idea
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,203 @@
+:root {
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  line-height: 1.5;
+  color-scheme: light dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  justify-content: center;
+}
+
+main {
+  width: 100%;
+  max-width: 720px;
+  padding: 2rem 1.25rem 4rem;
+}
+
+h1 {
+  margin: 0 0 1rem;
+  font-size: 2.25rem;
+  letter-spacing: -0.02em;
+}
+
+h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+  letter-spacing: -0.01em;
+}
+
+button {
+  font: inherit;
+  padding: 0.55rem 1rem;
+  border-radius: 6px;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.compact {
+  padding: 0.25rem 0.55rem;
+  font-size: 0.85rem;
+}
+
+button:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+button:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+code {
+  display: block;
+  padding: 0.75rem;
+  border-radius: 6px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9rem;
+  word-break: break-all;
+}
+
+.panel {
+  margin-top: 1.75rem;
+  padding: 1rem 1.1rem;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+}
+
+.row {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 0.6rem;
+}
+
+.now-playing {
+  display: grid;
+  gap: 0.2rem;
+  margin-bottom: 0.4rem;
+}
+
+.queue {
+  list-style: none;
+  padding: 0;
+  margin: 0.75rem 0 0;
+}
+
+.queue-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.5rem;
+  border-radius: 4px;
+  margin-bottom: 0.25rem;
+}
+
+.queue-row.current {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.queue-meta {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 0.1rem;
+}
+
+.queue-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.queue-actions {
+  display: flex;
+  gap: 0.25rem;
+  flex-shrink: 0;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  vertical-align: 1px;
+}
+
+.badge.ok {
+  border-color: color-mix(in srgb, mediumseagreen 60%, transparent);
+  color: mediumseagreen;
+}
+
+.badge.busy {
+  border-color: color-mix(in srgb, goldenrod 50%, transparent);
+  color: goldenrod;
+}
+
+.activity {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.activity li {
+  font-size: 0.85rem;
+  padding: 0.15rem 0;
+  border-bottom: 1px dashed color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.activity li:last-child {
+  border-bottom: none;
+}
+
+.muted {
+  opacity: 0.65;
+}
+
+.small {
+  font-size: 0.85rem;
+}
+
+.italic {
+  font-style: italic;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem;
+}
+
+.dropzone {
+  margin-top: 0.4rem;
+  padding: 1.25rem 1rem;
+  border: 1.5px dashed color-mix(in srgb, currentColor 30%, transparent);
+  border-radius: 8px;
+  text-align: center;
+  cursor: pointer;
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+
+.dropzone:hover,
+.dropzone.dragover {
+  opacity: 1;
+  border-color: currentColor;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+}
+
