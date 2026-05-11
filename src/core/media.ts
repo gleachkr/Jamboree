@@ -1,124 +1,383 @@
-// MediaCache: thin wrapper around a single browser WebTorrent client. Owns
-// torrent lifecycles, tracks progress per torrent, and hands out blob URLs
-// for ready files. The room (Y.Doc) carries TrackMeta with magnetURI; this
-// module turns those magnet URIs into playable bytes.
+// MediaCache: thin wrapper around a single browser WebTorrent client. Media
+// is organised into Batches — one .torrent per drop/import, addressable by
+// infoHash, with N audio files inside. The Yjs doc carries the .torrent bytes
+// (base64), so receivers don't have to wait on metadata exchange and can
+// surface the file list immediately.
 //
-// Idempotent on infoHash: callers may safely re-invoke addMagnet for tracks
-// they're already seeding or downloading. seedFile and addMagnet both
-// resolve to the same TorrentInfo shape so the caller can write a TrackMeta
-// without caring which flow produced it.
+// Receivers add each batch with `deselect: true`, which leaves the piece
+// picker idle. Pieces are only requested for files we explicitly select. The
+// MediaCache selects at most two files at any moment: the active track (the
+// one playing) at HIGH priority, and the upcoming track (next in queue) at
+// LOW priority for warmup. Everything else is metadata-only.
+//
+// Two URL paths, decided per entry:
+//   - Receivers use `file.streamURL`, served by WebTorrent's prebuilt SW
+//     (registered in main.tsx and passed in via swRegistration). Range
+//     requests resolve against the chunk store as pieces arrive.
+//   - Seeders use a plain object URL on the source File. We already have
+//     the bytes in memory, so we skip the SW round-trip entirely.
 
 import WebTorrent from 'webtorrent';
-import type { TrackId } from './types.ts';
+import type { BatchFile } from './types.ts';
 
-export type TorrentInfo = {
+export type SeededBatch = {
   infoHash: string;
-  magnetURI: string;
-  fileIndex: number;
-  fileName: string;
-  sizeBytes: number;
-  mime: string;
+  torrentFileBase64: string;
+  files: BatchFile[];
 };
 
 export type FileStatus =
   | { kind: 'unknown' }
   | { kind: 'pending'; numPeers: number }
   | {
-      kind: 'downloading';
+      kind: 'streaming';
+      url: string;
       progress: number;
       bytesDownloaded: number;
       bytesTotal: number;
       numPeers: number;
     }
-  // 100%-downloaded but the Blob hasn't finished assembling from the chunk
-  // store yet. Distinct from 'ready' so the UI can show "Buffering" rather
-  // than a stalled 100%.
-  | { kind: 'materializing'; bytesTotal: number; numPeers: number }
   | {
       kind: 'ready';
-      blobUrl: string;
+      url: string;
       bytesTotal: number;
       numPeers: number;
     };
 
+export type FileRef = { infoHash: string; fileIndex: number };
+
 type Entry = {
   torrent: WebTorrent.Torrent;
-  blobUrls: Map<number, string>;
-  // Pending getBlobURL() calls — coalesced so each file gets one outstanding
-  // request even if multiple subscribers ask at once.
-  blobUrlPending: Map<number, Promise<string>>;
+  kind: 'add' | 'seed';
+  startedAtMs: number;
+  // For seeds: per-fileIndex object URL on the source File. Built eagerly so
+  // playback can short-circuit straight to <audio src=...> without hitting
+  // the SW or the chunk store.
+  seedObjectUrls: Map<number, string>;
+  // Selections currently applied to the torrent's piece picker, indexed by
+  // fileIndex. The value is the priority that was passed to file.select().
+  // Tracked so a re-select with a different priority can deselect cleanly,
+  // rather than stacking duplicate selections inside WebTorrent.
+  selections: Map<number, number>;
+  lastProgressLogMs?: number;
+  lastProgressBytes?: number;
 };
 
-// Throttle subscriber notifications: WebTorrent emits 'download' on every
-// piece, which can fire hundreds of times per second on a fast peer. The UI
-// only needs ~4Hz to feel responsive.
+// Throttle subscriber notifications. WebTorrent emits 'download' on every
+// piece; the UI only needs ~4Hz to feel responsive.
 const NOTIFY_INTERVAL_MS = 250;
+
+// Per-file priorities. WebTorrent's piece picker treats higher numbers as
+// higher priority; selections accumulate per torrent. We layer two
+// selections at most: the currently-playing file (HIGH) and the next-in-queue
+// file (LOW). Everything else is deselected.
+const ACTIVE_PRIORITY = 5;
+const UPCOMING_PRIORITY = 2;
+
+// Diagnostic: how often to log download throughput while pieces are arriving.
+const PROGRESS_LOG_INTERVAL_MS = 2000;
 
 export class MediaCache {
   private readonly client: WebTorrent.Instance;
+  private readonly trackers: string[] | undefined;
   private readonly entries = new Map<string, Entry>();
   private readonly listeners = new Set<() => void>();
   private notifyTimer: ReturnType<typeof setTimeout> | null = null;
   private destroyed = false;
 
-  private readonly trackers: string[] | undefined;
+  // Pending addBatchFromDoc promises, keyed by infoHash, so concurrent calls
+  // for the same batch coalesce instead of racing into duplicate-add errors.
+  private readonly pendingAdds = new Map<string, Promise<void>>();
 
-  constructor(opts: { client?: WebTorrent.Instance; trackers?: string[] } = {}) {
+  private active: FileRef | null = null;
+  private upcoming: FileRef | null = null;
+
+  constructor(opts: {
+    client?: WebTorrent.Instance;
+    trackers?: string[];
+    swRegistration?: ServiceWorkerRegistration | null;
+  } = {}) {
     this.client = opts.client ?? new WebTorrent();
     this.trackers = opts.trackers && opts.trackers.length > 0 ? opts.trackers : undefined;
+    if (opts.swRegistration) {
+      // Streaming server: routes file.streamURL fetches through the SW into
+      // WebTorrent's chunk store. Without this, receivers have no way to
+      // play a track. (Seeds still play via seedObjectUrls.)
+      try {
+        (this.client as unknown as {
+          createServer(o: { controller: ServiceWorkerRegistration }): unknown;
+        }).createServer({ controller: opts.swRegistration });
+      } catch (err) {
+        console.warn('[jamboree] WebTorrent createServer failed', err);
+      }
+    }
   }
 
-  // Add a magnet idempotently. Resolves once the torrent has metadata so the
-  // caller can build a TrackMeta. For background fetches (remote peer's
-  // track) the caller can ignore the returned promise — the entry will keep
-  // downloading and progress is observable via getStatus().
-  addMagnet(magnetURI: string): Promise<TorrentInfo> {
+  // --- ingestion -------------------------------------------------------------
+
+  // Seed a batch of local files as one multi-file torrent (or a single-file
+  // torrent if files.length === 1). Resolves once the torrent is ready and
+  // its .torrent file has been built. The caller writes the SeededBatch into
+  // the Yjs doc as a Batch entry.
+  seedBatch(files: File[]): Promise<SeededBatch> {
     if (this.destroyed) return Promise.reject(new Error('MediaCache destroyed'));
-    const existing = this.findByMagnet(magnetURI);
-    if (existing) return this.toInfoOnReady(existing);
-    // Override the magnet's embedded tracker list (some peers may have
-    // generated it with WebTorrent's broken defaults). The peer-discovery
-    // mechanism is the tracker URL set, so swapping it here makes us look
-    // for peers on our trusted list — peers that are still on the bad
-    // trackers won't see us, but a peer using this build will.
-    const torrent = this.client.add(magnetURI, { announce: this.trackers });
-    return this.register(torrent);
+    if (files.length === 0) {
+      return Promise.reject(new Error('seedBatch: no files'));
+    }
+    mediaLog('seedBatch:start', { count: files.length });
+    const startedAtMs = performance.now();
+    return new Promise<SeededBatch>((resolve, reject) => {
+      let settled = false;
+      const settle = (action: () => void) => {
+        if (settled) return;
+        settled = true;
+        action();
+      };
+      try {
+        // WebTorrent.seed accepts File[] but @types/webtorrent only types
+        // single-File. Cast through unknown.
+        type SeedFn = (
+          input: File[],
+          opts: { announce?: string[] },
+          onseed: (t: WebTorrent.Torrent) => void,
+        ) => WebTorrent.Torrent;
+        const seedFn = this.client.seed as unknown as SeedFn;
+        const torrent = seedFn.call(
+          this.client,
+          files,
+          { announce: this.trackers },
+          (seeded) => {
+            // onseed fires both on first-time seed (seeded === torrent) and
+            // on duplicate-content (seeded is the pre-existing torrent and
+            // WebTorrent silently destroyed ours). Either way we register and
+            // resolve from the surviving torrent.
+            settle(() => {
+              this.register(seeded, 'seed', files, startedAtMs)
+                .then(resolve, reject);
+            });
+          },
+        );
+        torrent.on('error', (err: Error | string) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          const dup = parseDuplicate(msg);
+          if (dup && this.entries.has(dup)) {
+            // Re-seeding the same content: resolve to the existing entry.
+            settle(() => {
+              this.toSeededBatch(this.entries.get(dup)!.torrent).then(resolve, reject);
+            });
+            return;
+          }
+          settle(() => reject(err instanceof Error ? err : new Error(msg)));
+        });
+      } catch (err) {
+        settle(() => reject(err instanceof Error ? err : new Error(String(err))));
+      }
+    });
   }
 
-  // Seed a local file. Resolves once WebTorrent has hashed the file and
-  // produced a magnet URI.
-  seedFile(file: File): Promise<TorrentInfo> {
+  // Receive a batch by its .torrent bytes (from the Yjs doc). Adds with
+  // deselect:true so no pieces are requested until the caller selects a
+  // file via setActive / setUpcoming. Idempotent on infoHash; concurrent
+  // calls for the same batch coalesce.
+  addBatchFromDoc(batch: { infoHash: string; torrentFileBase64: string }): Promise<void> {
     if (this.destroyed) return Promise.reject(new Error('MediaCache destroyed'));
-    const torrent = this.client.seed(file, { announce: this.trackers });
-    return this.register(torrent);
+    if (this.entries.has(batch.infoHash)) return Promise.resolve();
+    const existing = this.pendingAdds.get(batch.infoHash);
+    if (existing) return existing;
+    const p = this.doAddBatchFromDoc(batch).finally(() => {
+      this.pendingAdds.delete(batch.infoHash);
+    });
+    this.pendingAdds.set(batch.infoHash, p);
+    return p;
   }
+
+  private async doAddBatchFromDoc(batch: {
+    infoHash: string;
+    torrentFileBase64: string;
+  }): Promise<void> {
+    mediaLog('addBatch:start', { hash: shortHash(batch.infoHash) });
+    const startedAtMs = performance.now();
+    let bytes: Uint8Array;
+    try {
+      bytes = base64ToUint8(batch.torrentFileBase64);
+    } catch (err) {
+      throw new Error(
+        `addBatchFromDoc: invalid base64 (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+    // Cast: @types/webtorrent doesn't expose the deselect/strategy options.
+    type AddOpts = {
+      announce?: string[];
+      deselect?: boolean;
+      strategy?: 'sequential' | 'rarest';
+    };
+    type AddFn = (torrentId: Uint8Array, opts: AddOpts) => WebTorrent.Torrent;
+    const addFn = this.client.add as unknown as AddFn;
+    let torrent: WebTorrent.Torrent;
+    try {
+      torrent = addFn.call(this.client, bytes, {
+        announce: this.trackers,
+        deselect: true,
+        strategy: 'sequential',
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const dup = parseDuplicate(msg);
+      if (dup && this.entries.has(dup)) return;
+      throw err instanceof Error ? err : new Error(msg);
+    }
+    await this.register(torrent, 'add', undefined, startedAtMs);
+  }
+
+  // --- active/upcoming -------------------------------------------------------
+
+  // Mark the file currently being played (HIGH priority) and the next one in
+  // queue (LOW priority warmup). Either may be null. Safe to call before
+  // the relevant batches have been added — the selections will be applied as
+  // soon as their torrent is registered.
+  setActive(target: FileRef | null): void {
+    if (sameRef(this.active, target)) return;
+    this.active = target;
+    this.reconcileSelections();
+  }
+
+  setUpcoming(target: FileRef | null): void {
+    if (sameRef(this.upcoming, target)) return;
+    this.upcoming = target;
+    this.reconcileSelections();
+  }
+
+  // Walk every entry, compute the desired selection priority per fileIndex,
+  // and call select/deselect to converge. Called whenever active or upcoming
+  // changes, and on torrent registration so a new batch picks up the right
+  // selections without the caller having to re-set them.
+  private reconcileSelections(): void {
+    const desired = this.desiredSelections();
+    for (const [infoHash, entry] of this.entries) {
+      if (entry.kind !== 'add') continue; // seeds have all bytes already
+      const want = desired.get(infoHash) ?? new Map();
+      this.applyEntrySelections(entry, want);
+    }
+  }
+
+  private desiredSelections(): Map<string, Map<number, number>> {
+    const out = new Map<string, Map<number, number>>();
+    const put = (ref: FileRef, priority: number) => {
+      let m = out.get(ref.infoHash);
+      if (!m) {
+        m = new Map();
+        out.set(ref.infoHash, m);
+      }
+      // Active wins over upcoming when both point at the same file (active
+      // is iterated first in apply()), but we still record only the higher
+      // priority here so the diff at apply() time is correct.
+      const cur = m.get(ref.fileIndex);
+      if (cur === undefined || priority > cur) m.set(ref.fileIndex, priority);
+    };
+    if (this.active) put(this.active, ACTIVE_PRIORITY);
+    if (this.upcoming) put(this.upcoming, UPCOMING_PRIORITY);
+    return out;
+  }
+
+  private applyEntrySelections(entry: Entry, want: Map<number, number>): void {
+    // Deselect files we no longer want, or whose priority changed.
+    for (const [fileIndex, prevPriority] of entry.selections) {
+      const nextPriority = want.get(fileIndex);
+      if (nextPriority === prevPriority) continue;
+      this.deselectFile(entry, fileIndex);
+    }
+    // Select (or re-select) files we now want.
+    for (const [fileIndex, priority] of want) {
+      if (entry.selections.get(fileIndex) === priority) continue;
+      this.selectFile(entry, fileIndex, priority);
+    }
+  }
+
+  private selectFile(entry: Entry, fileIndex: number, priority: number): void {
+    const file = entry.torrent.files[fileIndex];
+    if (!file) {
+      // Metadata not yet — registerOnce will reconcile on the 'ready' event.
+      return;
+    }
+    try {
+      (file as unknown as { select(priority: number): void }).select(priority);
+      entry.selections.set(fileIndex, priority);
+      mediaLog('select', {
+        hash: shortHash(entry.torrent.infoHash),
+        fileIndex,
+        priority,
+      });
+    } catch (err) {
+      mediaLog('select-failed', {
+        hash: shortHash(entry.torrent.infoHash),
+        fileIndex,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private deselectFile(entry: Entry, fileIndex: number): void {
+    const file = entry.torrent.files[fileIndex];
+    if (!file) {
+      entry.selections.delete(fileIndex);
+      return;
+    }
+    try {
+      (file as unknown as { deselect(): void }).deselect();
+    } catch (err) {
+      mediaLog('deselect-failed', {
+        hash: shortHash(entry.torrent.infoHash),
+        fileIndex,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+    entry.selections.delete(fileIndex);
+  }
+
+  // --- status queries --------------------------------------------------------
 
   getStatus(infoHash: string, fileIndex: number): FileStatus {
     const entry = this.entries.get(infoHash);
     if (!entry) return { kind: 'unknown' };
     const torrent = entry.torrent;
     const numPeers = torrent.numPeers;
-    if (!torrent.ready) return { kind: 'pending', numPeers };
+    // Seeder side: we have the bytes in memory.
+    const seedUrl = entry.seedObjectUrls.get(fileIndex);
+    if (seedUrl) {
+      const bytesTotal = torrent.files[fileIndex]?.length ?? 0;
+      return { kind: 'ready', url: seedUrl, bytesTotal, numPeers };
+    }
     const file = torrent.files[fileIndex];
+    // For add() with the .torrent bytes inline, files[] is populated
+    // synchronously, so this is only ever falsy for malformed inputs.
     if (!file) return { kind: 'pending', numPeers };
-    const blobUrl = entry.blobUrls.get(fileIndex);
-    if (blobUrl) {
-      return { kind: 'ready', blobUrl, bytesTotal: file.length, numPeers };
-    }
+    const streamUrl = (file as unknown as { streamURL?: string }).streamURL;
+    // No streamURL means the SW server isn't up (createServer failed or
+    // wasn't given a registration) — surface as pending so the UI doesn't
+    // claim playability.
+    if (!streamUrl) return { kind: 'pending', numPeers };
     if (file.progress >= 1) {
-      if (!entry.blobUrlPending.has(fileIndex)) {
-        void this.materializeBlobUrl(entry, fileIndex);
-      }
-      return { kind: 'materializing', bytesTotal: file.length, numPeers };
+      return { kind: 'ready', url: streamUrl, bytesTotal: file.length, numPeers };
     }
-    return {
-      kind: 'downloading',
-      progress: file.progress,
-      bytesDownloaded: file.downloaded,
-      bytesTotal: file.length,
-      numPeers,
-    };
+    // We surface streaming even before any pieces arrive, as long as the file
+    // is selected — at that point streamURL is well-defined and an <audio>
+    // src will start fetching ranges via the SW.
+    if (file.progress > 0 || entry.selections.has(fileIndex)) {
+      return {
+        kind: 'streaming',
+        url: streamUrl,
+        progress: file.progress,
+        bytesDownloaded: file.downloaded,
+        bytesTotal: file.length,
+        numPeers,
+      };
+    }
+    // Known torrent, file exists, but we haven't selected it — no pieces
+    // will arrive. The UI should show "queued, not yet warmed".
+    return { kind: 'pending', numPeers };
   }
+
+  // --- subscription / lifecycle ---------------------------------------------
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -135,7 +394,7 @@ export class MediaCache {
       this.notifyTimer = null;
     }
     for (const entry of this.entries.values()) {
-      for (const url of entry.blobUrls.values()) {
+      for (const url of entry.seedObjectUrls.values()) {
         try {
           URL.revokeObjectURL(url);
         } catch {
@@ -144,75 +403,132 @@ export class MediaCache {
       }
     }
     this.entries.clear();
+    this.pendingAdds.clear();
     this.listeners.clear();
     try {
       this.client.destroy();
     } catch {
-      // ignore — destroy on a half-initialised client may throw
+      // destroy on a half-initialised client may throw — non-fatal.
     }
   }
 
-  // --- internals -----------------------------------------------------------
+  // --- internals -------------------------------------------------------------
 
-  private findByMagnet(magnetURI: string): WebTorrent.Torrent | undefined {
-    // infoHash isn't directly exposed by parse-torrent here; cheaper to scan.
-    // Both magnetURI strings produced by WebTorrent are stable per infoHash,
-    // and we only ever add a given magnet via one path, so a string match
-    // also catches the seed-then-remote-add case.
-    for (const entry of this.entries.values()) {
-      if (entry.torrent.magnetURI === magnetURI) return entry.torrent;
+  // Register an entry for a freshly-created torrent (seed or add). Resolves
+  // once metadata is in hand so seedBatch's caller has a SeededBatch to
+  // write into the doc. For add() we already have metadata embedded in the
+  // .torrent bytes, so this resolves nearly immediately.
+  private register(
+    torrent: WebTorrent.Torrent,
+    kind: 'add' | 'seed',
+    seedFiles: File[] | undefined,
+    startedAtMs: number,
+  ): Promise<SeededBatch> {
+    const infoHash = torrent.infoHash;
+    if (infoHash && this.entries.has(infoHash)) {
+      // Duplicate path: WebTorrent handed us the existing torrent. Re-use the
+      // existing entry's seed URLs (we may be re-seeding the same files).
+      return this.toSeededBatch(this.entries.get(infoHash)!.torrent);
     }
-    return undefined;
-  }
-
-  private register(torrent: WebTorrent.Torrent): Promise<TorrentInfo> {
-    // Wire entry up immediately so getStatus has something to report even
-    // before the 'ready' event fires.
-    const entry: Entry = {
-      torrent,
-      blobUrls: new Map(),
-      blobUrlPending: new Map(),
-    };
-    // infoHash is set synchronously for seed(); for add() it appears on the
-    // 'infoHash' event. Store under a sentinel until known.
-    if (torrent.infoHash) {
-      this.entries.set(torrent.infoHash, entry);
-    } else {
-      torrent.once('infoHash', () => {
-        this.entries.set(torrent.infoHash, entry);
-        this.scheduleNotify();
+    const seedObjectUrls = new Map<number, string>();
+    if (seedFiles) {
+      // Build object URLs eagerly. Order matches the seed input, which is
+      // also the order WebTorrent assigns to torrent.files[]. (For multi-file
+      // seeds, WebTorrent stable-sorts by path; using file.name as the path
+      // means input order is preserved.)
+      seedFiles.forEach((f, i) => {
+        seedObjectUrls.set(i, URL.createObjectURL(f));
       });
     }
-    torrent.on('download', () => this.scheduleNotify());
-    torrent.on('upload', () => this.scheduleNotify());
-    torrent.on('wire', () => this.scheduleNotify());
-    torrent.on('done', () => this.scheduleNotify());
-    torrent.on('ready', () => this.scheduleNotify());
-    torrent.on('error', () => this.scheduleNotify());
-    torrent.on('warning', () => {
-      // Tracker warnings are noisy and benign. Swallow.
+    const entry: Entry = {
+      torrent,
+      kind,
+      startedAtMs,
+      seedObjectUrls,
+      selections: new Map(),
+    };
+    const log = (event: string, extra?: Record<string, unknown>) =>
+      mediaLog(`${kind}:${event}`, {
+        hash: shortHash(torrent.infoHash),
+        dt: dtSec(startedAtMs),
+        peers: torrent.numPeers,
+        ...extra,
+      });
+    log('register');
+
+    const finishRegistration = () => {
+      if (this.entries.has(torrent.infoHash)) return;
+      this.entries.set(torrent.infoHash, entry);
+      // A previously-set active/upcoming may apply to this batch.
+      this.reconcileSelections();
+    };
+
+    if (infoHash) finishRegistration();
+    else torrent.once('infoHash', finishRegistration);
+
+    torrent.on('download', () => {
+      this.logProgress(entry);
+      this.scheduleNotify();
     });
-    return this.toInfoOnReady(torrent);
+    torrent.on('upload', () => this.scheduleNotify());
+    // @types/webtorrent's overload set excludes 'wire' — cast through unknown.
+    (torrent.on as unknown as (
+      event: 'wire',
+      h: (wire: { remoteAddress?: string }) => void,
+    ) => void).call(torrent, 'wire', (wire) => {
+      log('wire', { addr: wire.remoteAddress });
+      this.scheduleNotify();
+    });
+    torrent.on('done', () => {
+      log('done');
+      this.scheduleNotify();
+    });
+    torrent.on('ready', () => {
+      log('ready', { files: torrent.files.map((f) => f.name) });
+      // Selections may have been queued before files[] was populated; apply
+      // them now.
+      this.reconcileSelections();
+      this.scheduleNotify();
+    });
+    torrent.on('noPeers', (announceType: string) =>
+      log('noPeers', { announceType }),
+    );
+    torrent.on('error', (e: Error | string) => {
+      log('error', { msg: e instanceof Error ? e.message : String(e) });
+      this.scheduleNotify();
+    });
+    torrent.on('warning', (w: Error | string) => {
+      const msg = w instanceof Error ? w.message : String(w);
+      console.warn(
+        `[jam/wt ${shortHash(torrent.infoHash)} +${dtSec(startedAtMs)}s] ${kind}:warning`,
+        msg,
+      );
+    });
+    return this.toSeededBatch(torrent);
   }
 
-  private toInfoOnReady(torrent: WebTorrent.Torrent): Promise<TorrentInfo> {
+  private toSeededBatch(torrent: WebTorrent.Torrent): Promise<SeededBatch> {
     return new Promise((resolve, reject) => {
       const onReady = () => {
         cleanup();
-        const fileIndex = pickAudioFileIndex(torrent.files);
-        const file = torrent.files[fileIndex];
-        if (!file) {
-          reject(new Error('torrent has no files'));
-          return;
+        try {
+          const tBytes = (torrent as unknown as { torrentFile: Uint8Array }).torrentFile;
+          const files: BatchFile[] = torrent.files.map((f) => ({
+            // f.path is the in-torrent path (matches single-file vs multi-file
+            // layout). f.name is the display basename.
+            path: (f as unknown as { path: string }).path ?? f.name,
+            name: f.name,
+            size: f.length,
+            mime: mimeFromFileName(f.name),
+          }));
+          resolve({
+            infoHash: torrent.infoHash,
+            torrentFileBase64: uint8ToBase64(tBytes),
+            files,
+          });
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
         }
-        resolve({
-          infoHash: torrent.infoHash,
-          magnetURI: torrent.magnetURI,
-          fileIndex,
-          fileName: file.name,
-          sizeBytes: file.length,
-          mime: mimeFromFileName(file.name),
-        });
       };
       const onError = (err: Error | string) => {
         cleanup();
@@ -230,31 +546,29 @@ export class MediaCache {
     });
   }
 
-  private async materializeBlobUrl(entry: Entry, fileIndex: number): Promise<void> {
-    const file = entry.torrent.files[fileIndex];
-    if (!file) return;
-    // WebTorrent v2 dropped the v1 `getBlobURL(cb)` API in favour of an
-    // async `file.blob()` returning a Blob. The shipped @types/webtorrent
-    // package still describes the v1 callback API, so we cast through an
-    // ad-hoc shape here. Switching to `client.createServer()` + streamURL
-    // would let us play before full download, but for Stage 3 we keep it
-    // simple and buffer the full Blob.
-    const fileV2 = file as unknown as { blob(): Promise<Blob> };
-    const pending = (async () => {
-      const blob = await fileV2.blob();
-      return URL.createObjectURL(blob);
-    })();
-    entry.blobUrlPending.set(fileIndex, pending);
-    try {
-      const url = await pending;
-      entry.blobUrls.set(fileIndex, url);
-      this.scheduleNotify();
-    } catch (err) {
-      // Surface in console — silent failures here cost us hours of confusion.
-      console.error('[jamboree] materializeBlobUrl failed', err);
-    } finally {
-      entry.blobUrlPending.delete(fileIndex);
-    }
+  // Throttled per-torrent throughput log. Records bytes-downloaded at each
+  // tick and reports the delta since the last tick, so the speed number is
+  // an observed average over the interval rather than WebTorrent's own
+  // exponential-moving-average `downloadSpeed`.
+  private logProgress(entry: Entry): void {
+    const now = performance.now();
+    const last = entry.lastProgressLogMs ?? entry.startedAtMs;
+    if (now - last < PROGRESS_LOG_INTERVAL_MS) return;
+    const torrent = entry.torrent;
+    const bytes = torrent.downloaded;
+    const lastBytes = entry.lastProgressBytes ?? 0;
+    const elapsedSec = (now - last) / 1000;
+    const bps = elapsedSec > 0 ? Math.round((bytes - lastBytes) / elapsedSec) : 0;
+    entry.lastProgressLogMs = now;
+    entry.lastProgressBytes = bytes;
+    mediaLog(`${entry.kind}:progress`, {
+      hash: shortHash(torrent.infoHash),
+      dt: dtSec(entry.startedAtMs),
+      progress: torrent.progress.toFixed(3),
+      kbps: Math.round(bps / 1024),
+      peers: torrent.numPeers,
+      downloadedKB: Math.round(bytes / 1024),
+    });
   }
 
   private scheduleNotify(): void {
@@ -272,18 +586,35 @@ export class MediaCache {
   }
 }
 
-// Picks the first audio file in the torrent if any look like audio,
-// otherwise returns 0. Magnet-only torrents from outside Jamboree may
-// include non-audio sidecars; we just default to the first thing.
-function pickAudioFileIndex(files: readonly { name: string }[]): number {
-  for (let i = 0; i < files.length; i++) {
-    if (looksLikeAudio(files[i]!.name)) return i;
-  }
-  return 0;
+// --- helpers ---------------------------------------------------------------
+
+function sameRef(a: FileRef | null, b: FileRef | null): boolean {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.infoHash === b.infoHash && a.fileIndex === b.fileIndex;
 }
 
-function looksLikeAudio(name: string): boolean {
-  return /\.(mp3|m4a|mp4|aac|flac|ogg|opus|wav|webm)$/i.test(name);
+function parseDuplicate(msg: string): string | null {
+  const m = /duplicate[^a-f0-9]*([a-f0-9]{40})/i.exec(msg);
+  return m ? m[1]!.toLowerCase() : null;
+}
+
+export function uint8ToBase64(bytes: Uint8Array): string {
+  // Chunked to avoid String.fromCharCode's argument-count limits on large
+  // inputs (~64KB+).
+  const chunk = 0x8000;
+  let s = '';
+  for (let i = 0; i < bytes.length; i += chunk) {
+    s += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(s);
+}
+
+export function base64ToUint8(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
 }
 
 function mimeFromFileName(name: string): string {
@@ -309,9 +640,16 @@ function mimeFromFileName(name: string): string {
   }
 }
 
-// Marker so callers can disambiguate logs originating from this module.
-export const MEDIA_CACHE_TAG = Symbol.for('jamboree:media-cache');
+// --- logging ---------------------------------------------------------------
 
-// Re-exported so consumers don't have to import from types.ts just for this
-// shape. Kept as a type alias rather than a brand for now.
-export type { TrackId };
+function mediaLog(event: string, fields: Record<string, unknown>): void {
+  console.log(`[jam/wt] ${event}`, fields);
+}
+
+function shortHash(infoHash: string | undefined): string {
+  return infoHash ? infoHash.slice(0, 8) : '????????';
+}
+
+function dtSec(startedAtMs: number): string {
+  return ((performance.now() - startedAtMs) / 1000).toFixed(2);
+}

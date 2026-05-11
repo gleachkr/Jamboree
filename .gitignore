@@ -3,6 +3,9 @@ dist
 dist-ssr
 *.local
 
+# Mirrored by vite.config.ts from node_modules/webtorrent/dist/.
+public/sw.min.js
+
 .vite
 .turbo
 *.tsbuildinfo

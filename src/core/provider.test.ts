@@ -33,8 +33,22 @@ function makePeer(hub: FakeTransportHub, peerId: string): Peer {
   return { id: peerId, room, awareness, provider, transport };
 }
 
-function trackInput(title: string) {
-  return { title, sourceKind: 'local-file' as const };
+let batchCounter = 0;
+function uniqueInfoHash(): string {
+  batchCounter += 1;
+  return batchCounter.toString(16).padStart(40, '0');
+}
+
+function addOne(peer: Peer, title: string): { trackId: string; entryId: string } {
+  const { trackIds, entryIds } = peer.room.addAndEnqueueBatch(
+    {
+      infoHash: uniqueInfoHash(),
+      torrentFileBase64: '',
+      files: [{ path: title, name: title, size: 1 }],
+    },
+    [{ title, fileIndex: 0 }],
+  );
+  return { trackId: trackIds[0]!, entryId: entryIds[0]! };
 }
 
 function queueTitles(peer: Peer): string[] {
@@ -48,10 +62,10 @@ describe('JamboreeYProvider — convergence', () => {
     const a = makePeer(hub, 'peer_a');
     const b = makePeer(hub, 'peer_b');
 
-    a.room.addAndEnqueue(trackInput('A1'));
-    a.room.addAndEnqueue(trackInput('A2'));
-    b.room.addAndEnqueue(trackInput('B1'));
-    b.room.addAndEnqueue(trackInput('B2'));
+    addOne(a, 'A1');
+    addOne(a, 'A2');
+    addOne(b, 'B1');
+    addOne(b, 'B2');
 
     expect(queueTitles(a)).toEqual(queueTitles(b));
     expect(queueTitles(a)).toHaveLength(4);
@@ -60,8 +74,8 @@ describe('JamboreeYProvider — convergence', () => {
   it('late joiner receives current queue and playback state', () => {
     const hub = new FakeTransportHub();
     const a = makePeer(hub, 'peer_a');
-    const { entryId } = a.room.addAndEnqueue(trackInput('Established'));
-    a.room.addAndEnqueue(trackInput('Also'));
+    const { entryId } = addOne(a, 'Established');
+    addOne(a, 'Also');
     a.room.play({ entryId });
 
     const b = makePeer(hub, 'peer_b');
@@ -76,7 +90,7 @@ describe('JamboreeYProvider — convergence', () => {
     const a = makePeer(hub, 'peer_a');
     const b = makePeer(hub, 'peer_b');
 
-    a.room.addAndEnqueue(trackInput('Shared'));
+    addOne(a, 'Shared');
     expect(queueTitles(b)).toEqual(['Shared']);
 
     // B disconnects, A makes another change, B reconnects with the same doc
@@ -84,7 +98,7 @@ describe('JamboreeYProvider — convergence', () => {
     b.provider.destroy();
     hub.disconnect('peer_b');
 
-    a.room.addAndEnqueue(trackInput('AfterBlip'));
+    addOne(a, 'AfterBlip');
 
     const transport = hub.connect('peer_b');
     const provider = new JamboreeYProvider({
@@ -108,7 +122,7 @@ describe('JamboreeYProvider — adverse delivery', () => {
     const b = makePeer(hub, 'peer_b');
     hub.flush(); // initial handshake
 
-    a.room.addAndEnqueue(trackInput('Once'));
+    addOne(a, 'Once');
 
     const captured = hub.takePending();
     expect(captured.length).toBeGreaterThan(0);
@@ -128,8 +142,8 @@ describe('JamboreeYProvider — adverse delivery', () => {
     const b = makePeer(hub, 'peer_b');
     hub.flush();
 
-    a.room.addAndEnqueue(trackInput('First'));
-    a.room.addAndEnqueue(trackInput('Second'));
+    addOne(a, 'First');
+    addOne(a, 'Second');
 
     const reversed = hub.takePending().reverse();
     hub.inject(reversed);
@@ -146,7 +160,7 @@ describe('JamboreeYProvider — adverse delivery', () => {
     const b = makePeer(hub, 'peer_b');
     hub.flush();
 
-    a.room.addAndEnqueue(trackInput('LostInPost'));
+    addOne(a, 'LostInPost');
 
     // Drop everything currently in flight.
     hub.takePending();

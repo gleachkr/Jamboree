@@ -4,6 +4,7 @@
 // can extrapolate continuous time locally without writing it back to Yjs.
 
 import type {
+  Batch,
   DerivedPlaybackState,
   PlaybackIntent,
   QueueEntry,
@@ -11,6 +12,7 @@ import type {
 } from './types.ts';
 
 export type RoomSnapshot = {
+  batches: ReadonlyMap<string, Batch>;
   tracks: ReadonlyMap<string, TrackMeta>;
   queue: readonly QueueEntry[];
   intents: readonly PlaybackIntent[];

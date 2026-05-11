@@ -1,6 +1,23 @@
 import { useEffect, useReducer, useRef, useState } from 'react';
 import { Awareness } from 'y-protocols/awareness';
 import {
+  DndContext,
+  PointerSensor,
+  TouchSensor,
+  KeyboardSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import {
   createInviteUrl,
   generateInvite,
   parseInviteFromParts,
@@ -9,12 +26,15 @@ import {
 import { JamboreeRoom } from './core/room.ts';
 import { currentPositionMs } from './core/playback.ts';
 import { JamboreeYProvider } from './core/provider.ts';
-import { MediaCache, type FileStatus } from './core/media.ts';
+import { MediaCache, type FileRef, type FileStatus } from './core/media.ts';
 import { WSS_TRACKERS } from './core/trackers.ts';
 import { joinJamboreeRoom } from './core/transport-trystero.ts';
 import type {
   ActivityRecord,
+  Batch,
   DerivedPlaybackState,
+  QueueEntry,
+  QueueEntryId,
   TrackMeta,
 } from './core/types.ts';
 
@@ -44,7 +64,11 @@ function storeName(value: string): void {
   }
 }
 
-export default function App() {
+export default function App({
+  swRegistration,
+}: {
+  swRegistration: ServiceWorkerRegistration | null;
+}) {
   const [initialInvite] = useState<RoomInvite | null>(readInviteFromBrowser);
   const [generated, setGenerated] = useState<RoomInvite | null>(null);
   const invite = initialInvite ?? generated;
@@ -61,11 +85,17 @@ export default function App() {
         <h1>Jamboree</h1>
         <p>An ephemeral, friends-only listening room.</p>
         <button onClick={createRoom}>Create a room</button>
+        {!swRegistration && (
+          <p className="small" style={{ color: 'crimson' }}>
+            Streaming service worker failed to register. Received tracks
+            won&apos;t play.
+          </p>
+        )}
       </main>
     );
   }
 
-  return <Room invite={invite} />;
+  return <Room invite={invite} swRegistration={swRegistration} />;
 }
 
 type RoomState = {
@@ -75,7 +105,13 @@ type RoomState = {
   media: MediaCache;
 };
 
-function Room({ invite }: { invite: RoomInvite }) {
+function Room({
+  invite,
+  swRegistration,
+}: {
+  invite: RoomInvite;
+  swRegistration: ServiceWorkerRegistration | null;
+}) {
   const [state, setState] = useState<RoomState | null>(null);
   const [, force] = useReducer((x: number) => x + 1, 0);
 
@@ -97,17 +133,22 @@ function Room({ invite }: { invite: RoomInvite }) {
       awareness,
       transport,
     });
-    const media = new MediaCache({ trackers: WSS_TRACKERS });
+    const media = new MediaCache({
+      trackers: WSS_TRACKERS,
+      swRegistration,
+    });
     setState({ room, awareness, provider, media });
 
     const unsubDoc = room.subscribe(force);
     const unsubMedia = media.subscribe(force);
+    const unsubPeers = provider.onPeerChange(force);
     const onAwareness = () => force();
     awareness.on('change', onAwareness);
 
     return () => {
       unsubDoc();
       unsubMedia();
+      unsubPeers();
       awareness.off('change', onAwareness);
       provider.destroy();
       media.destroy();
@@ -116,7 +157,7 @@ function Room({ invite }: { invite: RoomInvite }) {
       room.destroy();
       setState(null);
     };
-  }, [invite.roomId, invite.key]);
+  }, [invite.roomId, invite.key, swRegistration]);
 
   if (!state) return <main><h1>Jamboree</h1><p className="muted">Connecting…</p></main>;
 
@@ -124,26 +165,49 @@ function Room({ invite }: { invite: RoomInvite }) {
 }
 
 function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
-  const { room, awareness, media } = state;
+  const { room, awareness, media, provider } = state;
   const inviteUrl = createInviteUrl(invite, appBaseUrl());
   const derived = room.derivedState();
   const snap = room.snapshot();
   const peerStates = Array.from(awareness.getStates().entries());
+  const remotePeerCount = provider.getRemotePeers().size;
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // Auto-fetch any track we know about but haven't yet handed to WebTorrent.
-  // This includes both peers' tracks (newly arriving via Yjs sync) and our
-  // own tracks after a reload. addMagnet is idempotent, so no need to guard.
+  // Browsers tie media autoplay to a user-activation token that only lives
+  // synchronously inside the gesture handler. Most of our user actions go
+  // click → room.x() → Yjs update → re-render → useEffect → audio.play(),
+  // crossing an async boundary that loses activation. Calling play() inline
+  // during the click "unlocks" the element so later programmatic plays
+  // (including ones triggered by remote peers' intents) are allowed.
+  function gestureUnlock() {
+    const audio = audioRef.current;
+    if (!audio || !audio.src) return;
+    void audio.play().catch(() => {
+      // No src yet or browser still refused — useEffect path will retry
+      // and surface autoplayBlocked if it also fails.
+    });
+  }
+
+  // Auto-fetch any batch we know about but haven't yet handed to WebTorrent.
+  // This includes both peers' batches (newly arriving via Yjs sync) and our
+  // own after a reload. addBatchFromDoc is idempotent on infoHash; receivers
+  // add with deselect:true so no pieces are requested until a track in the
+  // batch is selected as current or upcoming.
   useEffect(() => {
-    for (const meta of snap.tracks.values()) {
-      if (meta.magnetURI) void media.addMagnet(meta.magnetURI);
+    for (const batch of snap.batches.values()) {
+      void media.addBatchFromDoc({
+        infoHash: batch.infoHash,
+        torrentFileBase64: batch.torrentFileBase64,
+      });
     }
-    // Re-run whenever the set of tracks changes. Using map size+ids as a
-    // cheap dependency — referential identity of snap changes every render.
-  }, [media, trackIdsFingerprint(snap.tracks)]);
+  }, [media, batchIdsFingerprint(snap.batches)]);
 
   return (
     <main>
-      <h1>Jamboree</h1>
+      <header className="room-header">
+        <h1>Jamboree</h1>
+        <ConnectionPill remotePeerCount={remotePeerCount} />
+      </header>
       <p>
         Room: <strong>{invite.roomId}</strong>
       </p>
@@ -153,17 +217,73 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
       </details>
 
       <PeersPanel awareness={awareness} peerStates={peerStates} />
-      <PlaybackPanel room={room} derived={derived} media={media} />
+      <PlaybackPanel
+        room={room}
+        derived={derived}
+        media={media}
+        audioRef={audioRef}
+        gestureUnlock={gestureUnlock}
+      />
       <IngestPanel room={room} media={media} />
-      <QueuePanel room={room} derived={derived} media={media} />
+      <QueuePanel
+        room={room}
+        derived={derived}
+        media={media}
+        gestureUnlock={gestureUnlock}
+      />
       <ActivityPanel room={room} />
     </main>
   );
 }
 
-function trackIdsFingerprint(tracks: ReadonlyMap<string, TrackMeta>): string {
-  const ids = Array.from(tracks.keys()).sort();
+function batchIdsFingerprint(batches: ReadonlyMap<string, Batch>): string {
+  const ids = Array.from(batches.keys()).sort();
   return ids.join('|');
+}
+
+// The next-in-queue file to pre-warm, given the currently-playing entry.
+// Null when there's nothing to warm — either the queue is empty or the
+// current entry is the last one. When nothing is playing yet, queue[0] is
+// the likely first play, so we warm it.
+function upcomingFileRef(
+  snap: {
+    queue: readonly QueueEntry[];
+    tracks: ReadonlyMap<string, TrackMeta>;
+    batches: ReadonlyMap<string, Batch>;
+  },
+  currentEntryId: QueueEntryId | undefined,
+): FileRef | null {
+  if (snap.queue.length === 0) return null;
+  let next: QueueEntry | undefined;
+  if (!currentEntryId) {
+    next = snap.queue[0];
+  } else {
+    const idx = snap.queue.findIndex((e) => e.entryId === currentEntryId);
+    next = idx < 0 ? undefined : snap.queue[idx + 1];
+  }
+  if (!next) return null;
+  const meta = snap.tracks.get(next.trackId);
+  if (!meta) return null;
+  const batch = snap.batches.get(meta.batchId);
+  if (!batch) return null;
+  return { infoHash: batch.infoHash, fileIndex: meta.fileIndex };
+}
+
+function ConnectionPill({ remotePeerCount }: { remotePeerCount: number }) {
+  if (remotePeerCount === 0) {
+    return (
+      <span className="conn-pill conn-pill--searching">
+        <span className="conn-dot" />
+        Searching for peers…
+      </span>
+    );
+  }
+  return (
+    <span className="conn-pill conn-pill--connected">
+      <span className="conn-dot" />
+      Connected · {remotePeerCount} {remotePeerCount === 1 ? 'peer' : 'peers'}
+    </span>
+  );
 }
 
 function PeersPanel({
@@ -221,32 +341,63 @@ function PlaybackPanel({
   room,
   derived,
   media,
+  audioRef,
+  gestureUnlock,
 }: {
   room: JamboreeRoom;
   derived: DerivedPlaybackState;
   media: MediaCache;
+  audioRef: React.RefObject<HTMLAudioElement | null>;
+  gestureUnlock: () => void;
 }) {
-  const [now, setNow] = useState(() => Date.now());
+  const [, tick] = useReducer((x: number) => x + 1, 0);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Re-render every 250ms while playing so the audio element's currentTime
+  // and the buffer-bar progress stay live in the UI. (Position is read
+  // directly off the audio element below; we just need a regular tick.)
   useEffect(() => {
-    if (derived.status !== 'playing') {
-      setNow(Date.now());
-      return;
-    }
-    const id = window.setInterval(() => setNow(Date.now()), 250);
+    if (derived.status !== 'playing') return;
+    const id = window.setInterval(tick, 250);
     return () => window.clearInterval(id);
   }, [derived.status, derived.effectiveAtWallMs, derived.queueEntryId]);
 
   const snap = room.snapshot();
   const currentTrack = derived.trackId ? snap.tracks.get(derived.trackId) : undefined;
+  const currentBatch = currentTrack ? snap.batches.get(currentTrack.batchId) : undefined;
   const fileStatus: FileStatus | null =
-    currentTrack?.infoHash != null
-      ? media.getStatus(currentTrack.infoHash, currentTrack.fileIndex ?? 0)
+    currentTrack && currentBatch
+      ? media.getStatus(currentBatch.infoHash, currentTrack.fileIndex)
       : null;
-  const blobUrl = fileStatus?.kind === 'ready' ? fileStatus.blobUrl : null;
+  // Both 'streaming' and 'ready' carry a playable URL. Streaming means the
+  // file is partially buffered — the audio element will request ranges via
+  // the service worker and stall if it outruns the chunk store; the buffer
+  // bar below the now-playing block makes that explicit.
+  const playUrl =
+    fileStatus && (fileStatus.kind === 'streaming' || fileStatus.kind === 'ready')
+      ? fileStatus.url
+      : null;
+  const bufferProgress = fileStatus?.kind === 'streaming' ? fileStatus.progress : null;
+
+  // Resolve the "next" queue entry/track for warmup. Only one file ahead is
+  // prefetched at LOW priority — selecting deeper into the queue would
+  // dilute the piece picker's attention and hurt the active track.
+  const nextRef = upcomingFileRef(snap, derived.queueEntryId);
+
+  // Tell the MediaCache which file is currently playing (HIGH priority) and
+  // which is queued up next (LOW priority warmup). Both may be null.
+  useEffect(() => {
+    media.setActive(
+      currentBatch && currentTrack
+        ? { infoHash: currentBatch.infoHash, fileIndex: currentTrack.fileIndex }
+        : null,
+    );
+  }, [media, currentBatch?.infoHash, currentTrack?.fileIndex]);
+
+  useEffect(() => {
+    media.setUpcoming(nextRef);
+  }, [media, nextRef?.infoHash, nextRef?.fileIndex]);
 
   // Slave the audio element to the room's playback intent. We re-anchor on
   // every change to sourceIntentId — that captures play/pause/seek/select
@@ -266,7 +417,7 @@ function PlaybackPanel({
       return;
     }
 
-    if (!blobUrl) return; // playing but media not ready yet — useEffect will re-fire when blobUrl arrives
+    if (!playUrl) return; // playing but media not ready yet — useEffect will re-fire when playUrl arrives
     const expectedSec = currentPositionMs(derived, Date.now()) / 1000;
     if (Math.abs(audio.currentTime - expectedSec) > 0.5) {
       audio.currentTime = expectedSec;
@@ -277,9 +428,15 @@ function PlaybackPanel({
         setAutoplayBlocked(false);
         setAudioError(null);
       }).catch((err: Error) => {
-        // NotAllowedError = autoplay block; other errors = decode/source issues.
+        // NotAllowedError = autoplay block.
+        // AbortError = the browser cancelled this play() because a fresh
+        // load() (src change) or pause() arrived right after — exactly what
+        // happens on track-switch / stop. Benign; don't surface it.
         if (err && err.name === 'NotAllowedError') {
           setAutoplayBlocked(true);
+          setAudioError(null);
+        } else if (err && err.name === 'AbortError') {
+          setAutoplayBlocked(false);
           setAudioError(null);
         } else {
           setAutoplayBlocked(false);
@@ -288,7 +445,7 @@ function PlaybackPanel({
       });
     }
   }, [
-    blobUrl,
+    playUrl,
     derived.status,
     derived.sourceIntentId,
     derived.queueEntryId,
@@ -299,21 +456,6 @@ function PlaybackPanel({
     const audio = audioRef.current;
     if (!audio) return;
     void audio.play().then(() => setAutoplayBlocked(false));
-  }
-
-  // Browsers tie media autoplay to a user-activation token that exists only
-  // synchronously inside the click handler. Our flow normally goes
-  // click → room.play() → Yjs update → re-render → useEffect → audio.play(),
-  // which crosses an async boundary and loses activation. Calling play()
-  // here, in the gesture, "unlocks" the element for subsequent programmatic
-  // plays (including ones triggered by remote peers' play intents).
-  function gestureUnlock() {
-    const audio = audioRef.current;
-    if (!audio || !audio.src) return;
-    void audio.play().catch(() => {
-      // No src yet, or browser still refused — useEffect path will retry
-      // and surface autoplayBlocked if it also fails.
-    });
   }
 
   function onPlay() {
@@ -336,7 +478,15 @@ function PlaybackPanel({
     room.seek(targetMs);
   }
 
-  const positionMs = currentPositionMs(derived, now);
+  // Read position straight off the audio element. We only have meaningful
+  // information once metadata has loaded; before that (and once the room
+  // intent is 'stopped', which resets currentTime to 0) we surface nothing
+  // rather than running an intent-based fake timer.
+  const audioEl = audioRef.current;
+  const positionMs =
+    audioEl && audioEl.readyState >= 1 && derived.status !== 'stopped'
+      ? audioEl.currentTime * 1000
+      : null;
 
   return (
     <section className="panel">
@@ -348,9 +498,12 @@ function PlaybackPanel({
         <div>
           Track: <strong>{currentTrack?.title ?? '—'}</strong>
         </div>
-        <div>Position: {formatMs(positionMs)}</div>
+        <div>Position: {positionMs !== null ? formatMs(positionMs) : '—'}</div>
         {currentTrack && fileStatus && (
           <div className="muted small">{describeStatus(fileStatus)}</div>
+        )}
+        {bufferProgress !== null && (
+          <BufferBar progress={bufferProgress} />
         )}
       </div>
       {/* Hidden — playback is driven by the room's intent state, surfaced
@@ -358,13 +511,19 @@ function PlaybackPanel({
           surface in the panel. */}
       <audio
         ref={audioRef}
-        src={blobUrl ?? undefined}
+        src={playUrl ?? undefined}
         preload="auto"
         onError={() => {
           const err = audioRef.current?.error;
-          setAudioError(
-            err ? `media error code ${err.code}: ${err.message}` : 'media error',
-          );
+          // MEDIA_ERR_ABORTED (1) fires when src changes mid-fetch — that's
+          // a benign side effect of track-switch / stop, not something the
+          // user needs to see. Everything else is a real decode/source
+          // problem and should surface.
+          if (!err || err.code === MediaError.MEDIA_ERR_ABORTED) {
+            setAudioError(null);
+            return;
+          }
+          setAudioError(`media error code ${err.code}: ${err.message}`);
         }}
       />
       {autoplayBlocked && (
@@ -387,10 +546,23 @@ function PlaybackPanel({
         )}
         <button onClick={onSkipNext}>Next</button>
         <button onClick={() => room.stop()}>Stop</button>
-        <button onClick={() => onSelectViaSeek(Math.max(0, positionMs - 10_000))}>
+        <button
+          disabled={positionMs === null}
+          onClick={() =>
+            positionMs !== null &&
+            onSelectViaSeek(Math.max(0, positionMs - 10_000))
+          }
+        >
           -10s
         </button>
-        <button onClick={() => onSelectViaSeek(positionMs + 30_000)}>+30s</button>
+        <button
+          disabled={positionMs === null}
+          onClick={() =>
+            positionMs !== null && onSelectViaSeek(positionMs + 30_000)
+          }
+        >
+          +30s
+        </button>
       </div>
     </section>
   );
@@ -402,10 +574,10 @@ function describeStatus(s: FileStatus): string {
       return 'Not in cache';
     case 'pending':
       return `Fetching metadata · ${s.numPeers} ${peerWord(s.numPeers)}`;
-    case 'downloading':
-      return `${(s.progress * 100).toFixed(0)}% · ${s.numPeers} ${peerWord(s.numPeers)}`;
-    case 'materializing':
-      return 'Buffering…';
+    case 'streaming':
+      // % is shown via the animated <BufferBar/>; the badge stays text-only
+      // so it doesn't jump on every piece (~2-4% each for small files).
+      return `Buffering · ${s.numPeers} ${peerWord(s.numPeers)}`;
     case 'ready':
       return `Ready · ${s.numPeers} ${peerWord(s.numPeers)}`;
   }
@@ -415,13 +587,28 @@ function statusBadgeClass(s: FileStatus): string {
   switch (s.kind) {
     case 'ready':
       return 'badge ok';
-    case 'materializing':
-    case 'downloading':
+    case 'streaming':
     case 'pending':
       return 'badge busy';
     case 'unknown':
       return 'badge';
   }
+}
+
+function BufferBar({ progress }: { progress: number }) {
+  const pct = Math.max(0, Math.min(1, progress)) * 100;
+  return (
+    <div
+      className="buffer-bar"
+      role="progressbar"
+      aria-label="Buffered"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(pct)}
+    >
+      <div className="buffer-bar-fill" style={{ width: `${pct}%` }} />
+    </div>
+  );
 }
 
 function peerWord(n: number): string {
@@ -432,12 +619,45 @@ function QueuePanel({
   room,
   derived,
   media,
+  gestureUnlock,
 }: {
   room: JamboreeRoom;
   derived: DerivedPlaybackState;
   media: MediaCache;
+  gestureUnlock: () => void;
 }) {
+  // Self-tick every 250ms so queue-row BufferBars animate smoothly even when
+  // the upstream media.subscribe → force() chain coalesces or drops updates
+  // during piece-arrival bursts. Mirrors PlaybackPanel's setNow interval.
+  const [, tick] = useReducer((x: number) => x + 1, 0);
+  useEffect(() => {
+    const id = window.setInterval(tick, 250);
+    return () => window.clearInterval(id);
+  }, []);
+
   const snap = room.snapshot();
+
+  // PointerSensor with a small distance so a tap doesn't accidentally start
+  // a drag — the body itself is the "select" target. TouchSensor uses a
+  // delay so scrolling the page still works on mobile; once held, drag is
+  // enabled.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, {
+      activationConstraint: { delay: 180, tolerance: 8 },
+    }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  function onDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const newIdx = snap.queue.findIndex((e) => e.entryId === over.id);
+    if (newIdx < 0) return;
+    room.moveQueueEntry(active.id as QueueEntryId, newIdx);
+  }
+
+  const ids = snap.queue.map((e) => e.entryId);
 
   return (
     <section className="panel">
@@ -445,123 +665,165 @@ function QueuePanel({
       {snap.queue.length === 0 ? (
         <p className="muted italic">Queue is empty. Drop an audio file above.</p>
       ) : (
-        <ol className="queue">
-          {snap.queue.map((entry, idx) => {
-            const meta = snap.tracks.get(entry.trackId);
-            const isCurrent = entry.entryId === derived.queueEntryId;
-            const status =
-              meta?.infoHash != null
-                ? media.getStatus(meta.infoHash, meta.fileIndex ?? 0)
-                : null;
-            return (
-              <li
-                key={entry.entryId}
-                className={`queue-row${isCurrent ? ' current' : ''}`}
-              >
-                <div className="queue-meta">
-                  <div className="queue-title">
-                    <strong>{meta?.title ?? '(missing)'}</strong>
-                  </div>
-                  <div className="queue-sub muted small">
-                    {shortPeer(entry.addedByPeerId)}
-                    {status && (
-                      <>
-                        {' · '}
-                        <span className={statusBadgeClass(status)}>
-                          {describeStatus(status)}
-                        </span>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <div className="queue-actions">
-                  <button
-                    className="compact"
-                    onClick={() => room.selectEntry(entry.entryId)}
-                  >
-                    Select
-                  </button>
-                  <button
-                    className="compact"
-                    disabled={idx === 0}
-                    onClick={() => room.moveQueueEntry(entry.entryId, idx - 1)}
-                  >
-                    Up
-                  </button>
-                  <button
-                    className="compact"
-                    disabled={idx === snap.queue.length - 1}
-                    onClick={() => room.moveQueueEntry(entry.entryId, idx + 1)}
-                  >
-                    Down
-                  </button>
-                  <button
-                    className="compact"
-                    onClick={() => room.removeQueueEntry(entry.entryId)}
-                  >
-                    Remove
-                  </button>
-                </div>
-              </li>
-            );
-          })}
-        </ol>
+        <DndContext
+          sensors={sensors}
+          collisionDetection={closestCenter}
+          onDragEnd={onDragEnd}
+        >
+          <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+            <ol className="queue">
+              {snap.queue.map((entry) => {
+                const meta = snap.tracks.get(entry.trackId);
+                const batch = meta ? snap.batches.get(meta.batchId) : undefined;
+                const isCurrent = entry.entryId === derived.queueEntryId;
+                const status =
+                  batch && meta
+                    ? media.getStatus(batch.infoHash, meta.fileIndex)
+                    : null;
+                return (
+                  <SortableQueueRow
+                    key={entry.entryId}
+                    entry={entry}
+                    meta={meta}
+                    status={status}
+                    isCurrent={isCurrent}
+                    onSelect={() => {
+                      gestureUnlock();
+                      room.selectEntry(entry.entryId);
+                    }}
+                    onRemove={() => room.removeQueueEntry(entry.entryId)}
+                  />
+                );
+              })}
+            </ol>
+          </SortableContext>
+        </DndContext>
       )}
     </section>
+  );
+}
+
+function SortableQueueRow({
+  entry,
+  meta,
+  status,
+  isCurrent,
+  onSelect,
+  onRemove,
+}: {
+  entry: QueueEntry;
+  meta: TrackMeta | undefined;
+  status: FileStatus | null;
+  isCurrent: boolean;
+  onSelect: () => void;
+  onRemove: () => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: entry.entryId });
+  const isReady = status?.kind === 'ready';
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    // Dim rows whose audio isn't ready yet so the eye is drawn to playable
+    // tracks. The drag handle and X stay full-strength via .queue-handle /
+    // .queue-remove rules so they remain easy to hit.
+    opacity: !isReady && !isDragging ? 0.55 : 1,
+    zIndex: isDragging ? 1 : undefined,
+  };
+  return (
+    <li
+      ref={setNodeRef}
+      style={style}
+      className={`queue-row${isCurrent ? ' current' : ''}${
+        isDragging ? ' dragging' : ''
+      }`}
+    >
+      <button
+        type="button"
+        className="queue-handle"
+        aria-label="Drag to reorder"
+        {...attributes}
+        {...listeners}
+      >
+        ⋮⋮
+      </button>
+      <button
+        type="button"
+        className="queue-tap"
+        onClick={onSelect}
+        aria-label={`Select ${meta?.title ?? 'track'}`}
+      >
+        <div className="queue-title">
+          {isCurrent ? '▶ ' : ''}
+          <strong>{meta?.title ?? '(missing)'}</strong>
+        </div>
+        <div className="queue-sub muted small">
+          {shortPeer(entry.addedByPeerId)}
+          {status && (
+            <>
+              {' · '}
+              <span className={statusBadgeClass(status)}>
+                {describeStatus(status)}
+              </span>
+            </>
+          )}
+        </div>
+        {status?.kind === 'streaming' && (
+          <BufferBar progress={status.progress} />
+        )}
+      </button>
+      <button
+        type="button"
+        className="queue-remove"
+        onClick={onRemove}
+        aria-label={`Remove ${meta?.title ?? 'track'}`}
+      >
+        ×
+      </button>
+    </li>
   );
 }
 
 function IngestPanel({ room, media }: { room: JamboreeRoom; media: MediaCache }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [magnet, setMagnet] = useState('');
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  async function ingestFiles(files: File[]) {
-    if (files.length === 0) return;
-    setError(null);
-    for (const file of files) {
-      setBusy(`Hashing ${file.name}…`);
-      try {
-        const info = await media.seedFile(file);
-        room.addAndEnqueue({
-          title: file.name,
-          sourceKind: 'magnet',
-          mime: file.type || info.mime,
-          sizeBytes: info.sizeBytes,
-          magnetURI: info.magnetURI,
-          infoHash: info.infoHash,
-          fileName: info.fileName,
-          fileIndex: info.fileIndex,
-        });
-      } catch (e) {
-        setError(`Failed to seed ${file.name}: ${describeError(e)}`);
-      }
+  // Whole-drop ingestion: every file the user drops in a single gesture
+  // becomes one multi-file torrent (one Batch in the doc). Receivers add
+  // the batch with deselect:true and only fetch pieces for whichever
+  // file is selected as current/upcoming.
+  async function ingestFiles(rawFiles: File[]) {
+    const files = rawFiles.filter(isAudioFile);
+    if (files.length === 0) {
+      if (rawFiles.length > 0) setError('No audio files in the drop.');
+      return;
     }
-    setBusy(null);
-  }
-
-  async function ingestMagnet() {
-    const m = magnet.trim();
-    if (!m) return;
     setError(null);
-    setBusy('Fetching torrent metadata…');
+    setBusy(
+      files.length === 1
+        ? `Hashing ${files[0]!.name}…`
+        : `Hashing ${files.length} files…`,
+    );
     try {
-      const info = await media.addMagnet(m);
-      room.addAndEnqueue({
-        title: info.fileName,
-        sourceKind: 'magnet',
-        mime: info.mime,
-        sizeBytes: info.sizeBytes,
-        magnetURI: info.magnetURI,
-        infoHash: info.infoHash,
-        fileName: info.fileName,
-        fileIndex: info.fileIndex,
-      });
-      setMagnet('');
+      const seeded = await media.seedBatch(files);
+      const trackInputs = seeded.files.map((f, i) => ({
+        title: f.name,
+        mime: f.mime,
+        sizeBytes: f.size,
+        fileIndex: i,
+      }));
+      room.addAndEnqueueBatch(
+        {
+          infoHash: seeded.infoHash,
+          torrentFileBase64: seeded.torrentFileBase64,
+          files: seeded.files,
+        },
+        trackInputs,
+      );
     } catch (e) {
-      setError(`Failed to add magnet: ${describeError(e)}`);
+      setError(`Failed to seed batch: ${describeError(e)}`);
     } finally {
       setBusy(null);
     }
@@ -606,18 +868,6 @@ function IngestPanel({ room, media }: { room: JamboreeRoom; media: MediaCache })
           }}
         />
       </div>
-      <div className="row">
-        <input
-          type="text"
-          placeholder="magnet:?xt=urn:btih:…"
-          value={magnet}
-          onChange={(e) => setMagnet(e.target.value)}
-          style={{ flex: 1, minWidth: '12rem' }}
-        />
-        <button onClick={() => void ingestMagnet()} disabled={!magnet.trim()}>
-          Add magnet
-        </button>
-      </div>
       {busy && <p className="muted small">{busy}</p>}
       {error && <p className="small" style={{ color: 'crimson' }}>{error}</p>}
     </section>
@@ -627,6 +877,13 @@ function IngestPanel({ room, media }: { room: JamboreeRoom; media: MediaCache })
 function describeError(e: unknown): string {
   if (e instanceof Error) return e.message;
   return String(e);
+}
+
+function isAudioFile(f: File): boolean {
+  if (f.type && f.type.startsWith('audio/')) return true;
+  // Browsers don't always populate File.type for drag-and-drop. Fall back to
+  // an extension sniff so dropped folders work consistently.
+  return /\.(mp3|m4a|mp4|aac|flac|ogg|opus|wav|webm)$/i.test(f.name);
 }
 
 function ActivityPanel({ room }: { room: JamboreeRoom }) {

@@ -38,6 +38,7 @@ export class JamboreeYProvider {
   private destroyed = false;
   private readonly unsubs: Array<() => void> = [];
   private readonly remotePeers = new Set<string>();
+  private readonly peerChangeListeners = new Set<() => void>();
 
   constructor(opts: JamboreeYProviderOptions) {
     this.doc = opts.doc;
@@ -80,12 +81,29 @@ export class JamboreeYProvider {
     this.sendOurAwarenessTo(peerId);
   }
 
+  // Transport-level peer set. Distinct from Awareness's clientID set:
+  // remotePeers tracks WebRTC-connected peers, including ones that haven't
+  // yet exchanged any awareness state. UIs that want a "connecting → N
+  // peers" indicator should use this rather than counting awareness states,
+  // which lag behind by an RTT or more on slow links.
+  getRemotePeers(): ReadonlySet<string> {
+    return this.remotePeers;
+  }
+
+  onPeerChange(listener: () => void): () => void {
+    this.peerChangeListeners.add(listener);
+    return () => {
+      this.peerChangeListeners.delete(listener);
+    };
+  }
+
   // --- handlers --------------------------------------------------------------
 
   private handlePeerJoin = (peerId: string): void => {
     this.remotePeers.add(peerId);
     this.sendStateVectorTo(peerId);
     this.sendOurAwarenessTo(peerId);
+    this.firePeerChange();
   };
 
   private handlePeerLeave = (peerId: string): void => {
@@ -93,7 +111,18 @@ export class JamboreeYProvider {
     // We don't know which Awareness clientIDs map to which transport peer, so
     // we let the peer's own clock heartbeat expire. (DESIGN.md §4.6 makes
     // awareness explicitly ephemeral — this is fine.)
+    this.firePeerChange();
   };
+
+  private firePeerChange(): void {
+    for (const l of this.peerChangeListeners) {
+      try {
+        l();
+      } catch {
+        // a single bad listener shouldn't poison the rest
+      }
+    }
+  }
 
   private handleStateVector = (peerId: string, sv: Uint8Array): void => {
     const diff = Y.encodeStateAsUpdate(this.doc, sv);

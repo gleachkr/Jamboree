@@ -1,14 +1,35 @@
-// Shared room model types. These mirror DESIGN.md §4 but target Stage 1:
-// queue + tracks + playback intents only. Awareness, snapshots, chat, and
-// settings are deferred until later stages.
+// Shared room model types. Media is grouped into Batches: one .torrent per
+// drop/import, addressable by infoHash, with N audio files inside. A Track is
+// a thin reference to (batchId, fileIndex) plus presentation metadata.
 
 export type TrackId = string;
+export type BatchId = string;
 export type QueueEntryId = string;
 export type IntentId = string;
 export type ActivityId = string;
 export type PeerId = string;
 
-export type TrackSourceKind = 'local-file' | 'magnet' | 'web-seed' | 'url';
+export type BatchFile = {
+  // Path inside the torrent. For a single-file batch this is just the
+  // filename; for a multi-file batch it's the per-file path WebTorrent
+  // reports on file.path.
+  path: string;
+  name: string;
+  size: number;
+  mime?: string;
+};
+
+// A Batch holds the .torrent bytes for one drop. Receivers decode the bytes
+// directly into WebTorrent.add — they don't wait on metadata exchange, and
+// they don't have to download anything until a referenced track is selected.
+export type Batch = {
+  id: BatchId;
+  infoHash: string;
+  torrentFileBase64: string;
+  files: BatchFile[];
+  addedByPeerId: PeerId;
+  addedAt: number;
+};
 
 export type TrackMeta = {
   id: TrackId;
@@ -18,14 +39,11 @@ export type TrackMeta = {
   durationMs?: number;
   mime?: string;
   sizeBytes?: number;
-  magnetURI?: string;
-  fileName?: string;
-  fileIndex?: number;
-  infoHash?: string;
+  // Reference into the batches map. fileIndex indexes batch.files.
+  batchId: BatchId;
+  fileIndex: number;
   addedByPeerId: PeerId;
   addedAt: number;
-  sourceKind: TrackSourceKind;
-  webSeeds?: string[];
 };
 
 export type QueueEntry = {

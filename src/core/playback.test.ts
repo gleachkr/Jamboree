@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { currentPositionMs, derivePlaybackState, type RoomSnapshot } from './playback.ts';
-import type { PlaybackIntent, QueueEntry, TrackMeta } from './types.ts';
+import type { Batch, PlaybackIntent, QueueEntry, TrackMeta } from './types.ts';
 
 let intentSeq = 0;
 function intent(fields: Partial<PlaybackIntent> & Pick<PlaybackIntent, 'kind' | 'createdAtWallMs'>): PlaybackIntent {
@@ -21,13 +21,21 @@ function entry(entryId: string, trackId: string): QueueEntry {
 }
 
 function track(id: string, title: string): TrackMeta {
-  return { id, title, addedByPeerId: 'peer_a', addedAt: 0, sourceKind: 'local-file' };
+  return {
+    id,
+    title,
+    batchId: 'batch_test',
+    fileIndex: 0,
+    addedByPeerId: 'peer_a',
+    addedAt: 0,
+  };
 }
 
 function snapshot(opts: { queue?: QueueEntry[]; intents?: PlaybackIntent[]; tracks?: TrackMeta[] } = {}): RoomSnapshot {
   const tracks = new Map<string, TrackMeta>();
   for (const t of opts.tracks ?? []) tracks.set(t.id, t);
-  return { tracks, queue: opts.queue ?? [], intents: opts.intents ?? [] };
+  const batches = new Map<string, Batch>();
+  return { batches, tracks, queue: opts.queue ?? [], intents: opts.intents ?? [] };
 }
 
 describe('derivePlaybackState', () => {

@@ -1,13 +1,17 @@
-// JamboreeRoom: the local Yjs-backed room model. UI and (later) the network
-// provider talk to this class via the command layer; nobody mutates Y.Doc
-// structures directly. Per DESIGN.md §15.1, every command runs in a single
-// Y transaction and appends an activity record so the UI can show "who did
-// what" without inferring it from CRDT diffs.
+// JamboreeRoom: the local Yjs-backed room model. UI and the network provider
+// talk to this class via the command layer; nobody mutates Y.Doc structures
+// directly. Per DESIGN.md §15.1, every command runs in a single Y transaction
+// and appends an activity record.
+//
+// Media is grouped into Batches (one .torrent per drop). Tracks reference a
+// (batchId, fileIndex). See DESIGN.md §6 / types.ts.
 
 import * as Y from 'yjs';
 import type {
   ActivityId,
   ActivityRecord,
+  Batch,
+  BatchId,
   DerivedPlaybackState,
   IntentId,
   PeerId,
@@ -20,7 +24,14 @@ import type {
 } from './types.ts';
 import { derivePlaybackState, type RoomSnapshot } from './playback.ts';
 
-export type NewTrackInput = Omit<TrackMeta, 'id' | 'addedByPeerId' | 'addedAt'> & {
+export type NewBatchInput = Omit<Batch, 'id' | 'addedByPeerId' | 'addedAt'> & {
+  id?: BatchId;
+};
+
+export type NewTrackInput = Omit<
+  TrackMeta,
+  'id' | 'addedByPeerId' | 'addedAt' | 'batchId'
+> & {
   id?: TrackId;
 };
 
@@ -30,7 +41,7 @@ export type RoomOptions = {
   now?: () => number;
 };
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export class JamboreeRoom {
   readonly doc: Y.Doc;
@@ -44,10 +55,8 @@ export class JamboreeRoom {
     this.peerId = opts.peerId ?? randomId('peer');
     this.now = opts.now ?? Date.now;
 
-    // Touch the shared types so they exist with the expected kinds, and seed
-    // metadata if the doc is fresh. Wrapped so we don't emit a meaningless
-    // update for a doc that already has these initialised by another peer.
     this.doc.transact(() => {
+      this.batchesMap();
       this.tracksMap();
       this.queueArray();
       this.intentsArray();
@@ -62,6 +71,10 @@ export class JamboreeRoom {
 
   metaMap(): Y.Map<unknown> {
     return this.doc.getMap('meta');
+  }
+
+  batchesMap(): Y.Map<Batch> {
+    return this.doc.getMap<Batch>('batches');
   }
 
   tracksMap(): Y.Map<TrackMeta> {
@@ -83,9 +96,12 @@ export class JamboreeRoom {
   // --- snapshot / derived state ---------------------------------------------
 
   snapshot(): RoomSnapshot {
+    const batches = new Map<BatchId, Batch>();
+    for (const [id, batch] of this.batchesMap().entries()) batches.set(id, batch);
     const tracks = new Map<TrackId, TrackMeta>();
     for (const [id, meta] of this.tracksMap().entries()) tracks.set(id, meta);
     return {
+      batches,
       tracks,
       queue: this.queueArray().toArray(),
       intents: this.intentsArray().toArray(),
@@ -100,13 +116,38 @@ export class JamboreeRoom {
     return this.activityArray().toArray();
   }
 
-  // --- queue commands --------------------------------------------------------
+  // --- batch / track commands -----------------------------------------------
 
-  addTrack(input: NewTrackInput): TrackId {
+  // Adds a Batch by infoHash. If a batch with the same infoHash already
+  // exists, returns its id without re-adding — drag-and-drop of the same
+  // file twice should converge, not duplicate.
+  addBatch(input: NewBatchInput): BatchId {
+    const existing = this.findBatchByInfoHash(input.infoHash);
+    if (existing) return existing.id;
+    const id = input.id ?? randomId('batch');
+    const batch: Batch = {
+      id,
+      infoHash: input.infoHash,
+      torrentFileBase64: input.torrentFileBase64,
+      files: input.files,
+      addedByPeerId: this.peerId,
+      addedAt: this.now(),
+    };
+    this.doc.transact(() => {
+      this.batchesMap().set(id, batch);
+    }, this);
+    return id;
+  }
+
+  addTrack(batchId: BatchId, input: NewTrackInput): TrackId {
+    if (!this.batchesMap().has(batchId)) {
+      throw new Error(`addTrack: unknown batchId ${batchId}`);
+    }
     const id = input.id ?? randomId('track');
     const meta: TrackMeta = {
       ...input,
       id,
+      batchId,
       addedByPeerId: this.peerId,
       addedAt: this.now(),
     };
@@ -135,14 +176,25 @@ export class JamboreeRoom {
     return entryId;
   }
 
-  addAndEnqueue(input: NewTrackInput): { trackId: TrackId; entryId: QueueEntryId } {
-    let trackId!: TrackId;
-    let entryId!: QueueEntryId;
+  // The drop-flow entry point: add one Batch + N Tracks + N QueueEntries in a
+  // single Y transaction so peers either see the whole batch or none of it.
+  addAndEnqueueBatch(
+    batchInput: NewBatchInput,
+    trackInputs: ReadonlyArray<NewTrackInput>,
+  ): { batchId: BatchId; trackIds: TrackId[]; entryIds: QueueEntryId[] } {
+    let batchId!: BatchId;
+    const trackIds: TrackId[] = [];
+    const entryIds: QueueEntryId[] = [];
     this.doc.transact(() => {
-      trackId = this.addTrack(input);
-      entryId = this.enqueueTrack(trackId);
+      batchId = this.addBatch(batchInput);
+      for (const input of trackInputs) {
+        const trackId = this.addTrack(batchId, input);
+        const entryId = this.enqueueTrack(trackId);
+        trackIds.push(trackId);
+        entryIds.push(entryId);
+      }
     }, this);
-    return { trackId, entryId };
+    return { batchId, trackIds, entryIds };
   }
 
   removeQueueEntry(entryId: QueueEntryId): boolean {
@@ -256,6 +308,13 @@ export class JamboreeRoom {
   }
 
   // --- internals -------------------------------------------------------------
+
+  private findBatchByInfoHash(infoHash: string): Batch | undefined {
+    for (const batch of this.batchesMap().values()) {
+      if (batch.infoHash === infoHash) return batch;
+    }
+    return undefined;
+  }
 
   private appendIntent(
     fields: { kind: PlaybackIntentKind } & Partial<
