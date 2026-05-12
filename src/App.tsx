@@ -26,9 +26,10 @@ import {
 import { JamboreeRoom } from './core/room.ts';
 import { currentPositionMs } from './core/playback.ts';
 import { JamboreeYProvider } from './core/provider.ts';
-import { MediaCache, type FileRef, type FileStatus } from './core/media.ts';
+import { MediaCache, type FileStatus } from './core/media.ts';
 import { WSS_TRACKERS } from './core/trackers.ts';
 import { joinJamboreeRoom } from './core/transport-trystero.ts';
+import { nextWarmupFileRef } from './core/warmup.ts';
 import type {
   ActivityRecord,
   Batch,
@@ -241,34 +242,6 @@ function batchIdsFingerprint(batches: ReadonlyMap<string, Batch>): string {
   return ids.join('|');
 }
 
-// The next-in-queue file to pre-warm, given the currently-playing entry.
-// Null when there's nothing to warm — either the queue is empty or the
-// current entry is the last one. When nothing is playing yet, queue[0] is
-// the likely first play, so we warm it.
-function upcomingFileRef(
-  snap: {
-    queue: readonly QueueEntry[];
-    tracks: ReadonlyMap<string, TrackMeta>;
-    batches: ReadonlyMap<string, Batch>;
-  },
-  currentEntryId: QueueEntryId | undefined,
-): FileRef | null {
-  if (snap.queue.length === 0) return null;
-  let next: QueueEntry | undefined;
-  if (!currentEntryId) {
-    next = snap.queue[0];
-  } else {
-    const idx = snap.queue.findIndex((e) => e.entryId === currentEntryId);
-    next = idx < 0 ? undefined : snap.queue[idx + 1];
-  }
-  if (!next) return null;
-  const meta = snap.tracks.get(next.trackId);
-  if (!meta) return null;
-  const batch = snap.batches.get(meta.batchId);
-  if (!batch) return null;
-  return { infoHash: batch.infoHash, fileIndex: meta.fileIndex };
-}
-
 function ConnectionPill({ remotePeerCount }: { remotePeerCount: number }) {
   if (remotePeerCount === 0) {
     return (
@@ -380,13 +353,17 @@ function PlaybackPanel({
       : null;
   const bufferProgress = fileStatus?.kind === 'streaming' ? fileStatus.progress : null;
 
-  // Resolve the "next" queue entry/track for warmup. Only one file ahead is
-  // prefetched at LOW priority — selecting deeper into the queue would
-  // dilute the piece picker's attention and hurt the active track.
-  const nextRef = upcomingFileRef(snap, derived.queueEntryId);
+  // Resolve the next not-ready queue entry/track for serial warmup. Only one
+  // non-active file is prefetched at LOW priority at a time; once it is
+  // ready, the scan skips it and moves farther down the upcoming queue.
+  const nextRef = nextWarmupFileRef(
+    snap,
+    derived.queueEntryId,
+    (infoHash, fileIndex) => media.getStatus(infoHash, fileIndex),
+  );
 
   // Tell the MediaCache which file is currently playing (HIGH priority) and
-  // which is queued up next (LOW priority warmup). Both may be null.
+  // which upcoming file is being warmed (LOW priority). Both may be null.
   useEffect(() => {
     media.setActive(
       currentBatch && currentTrack

@@ -7,8 +7,8 @@
 // Receivers add each batch with `deselect: true`, which leaves the piece
 // picker idle. Pieces are only requested for files we explicitly select. The
 // MediaCache selects at most two files at any moment: the active track (the
-// one playing) at HIGH priority, and the upcoming track (next in queue) at
-// LOW priority for warmup. Everything else is metadata-only.
+// one playing) at HIGH priority, and one not-yet-ready upcoming track at LOW
+// priority for warmup. Everything else is metadata-only.
 //
 // Two URL paths, decided per entry:
 //   - Receivers use `file.streamURL`, served by WebTorrent's prebuilt SW
@@ -69,7 +69,7 @@ const NOTIFY_INTERVAL_MS = 250;
 
 // Per-file priorities. WebTorrent's piece picker treats higher numbers as
 // higher priority; selections accumulate per torrent. We layer two
-// selections at most: the currently-playing file (HIGH) and the next-in-queue
+// selections at most: the currently-playing file (HIGH) and one upcoming
 // file (LOW). Everything else is deselected.
 const ACTIVE_PRIORITY = 5;
 const UPCOMING_PRIORITY = 2;
@@ -231,8 +231,8 @@ export class MediaCache {
 
   // --- active/upcoming -------------------------------------------------------
 
-  // Mark the file currently being played (HIGH priority) and the next one in
-  // queue (LOW priority warmup). Either may be null. Safe to call before
+  // Mark the file currently being played (HIGH priority) and one upcoming
+  // queue file (LOW priority warmup). Either may be null. Safe to call before
   // the relevant batches have been added — the selections will be applied as
   // soon as their torrent is registered.
   setActive(target: FileRef | null): void {
