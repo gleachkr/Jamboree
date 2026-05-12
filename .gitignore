@@ -17,3 +17,5 @@ npm-debug.log*
 .idea
 .vscode/*
 !.vscode/extensions.json
+DESIGN.md
+*.lec
