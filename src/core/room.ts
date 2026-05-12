@@ -263,12 +263,18 @@ export class JamboreeRoom {
     });
   }
 
-  skipNext(): IntentId {
-    return this.appendIntent({ kind: 'skip-next' });
+  skipNext(opts: { fromEntryId?: QueueEntryId } = {}): IntentId {
+    return this.appendIntent({
+      kind: 'skip-next',
+      queueEntryId: opts.fromEntryId,
+    });
   }
 
-  skipPrevious(): IntentId {
-    return this.appendIntent({ kind: 'skip-previous' });
+  skipPrevious(opts: { fromEntryId?: QueueEntryId } = {}): IntentId {
+    return this.appendIntent({
+      kind: 'skip-previous',
+      queueEntryId: opts.fromEntryId,
+    });
   }
 
   stop(): IntentId {

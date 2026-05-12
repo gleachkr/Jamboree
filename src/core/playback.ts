@@ -113,6 +113,7 @@ function applyIntent(
     }
 
     case 'skip-next': {
+      if (!matchesExpectedEntry(prior, intent)) return prior;
       const next = neighbor(queue, prior.queueEntryId, +1);
       if (!next) return { ...STOPPED, effectiveAtWallMs: t, sourceIntentId: intent.id };
       return {
@@ -125,6 +126,7 @@ function applyIntent(
     }
 
     case 'skip-previous': {
+      if (!matchesExpectedEntry(prior, intent)) return prior;
       const prev = neighbor(queue, prior.queueEntryId, -1);
       if (!prev) return { ...STOPPED, effectiveAtWallMs: t, sourceIntentId: intent.id };
       return {
@@ -144,6 +146,13 @@ function applyIntent(
 function frozenPosition(state: DerivedPlaybackState, atWallMs: number): number {
   if (state.status !== 'playing') return state.positionMs;
   return Math.max(0, state.positionMs + (atWallMs - state.effectiveAtWallMs));
+}
+
+function matchesExpectedEntry(
+  prior: DerivedPlaybackState,
+  intent: PlaybackIntent,
+): boolean {
+  return !intent.queueEntryId || prior.queueEntryId === intent.queueEntryId;
 }
 
 function neighbor(

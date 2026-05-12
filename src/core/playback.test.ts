@@ -115,6 +115,20 @@ describe('derivePlaybackState', () => {
     expect(state.status).toBe('playing');
   });
 
+  it('guarded skip-next only applies from the expected entry', () => {
+    const queue = [entry('e1', 't1'), entry('e2', 't2'), entry('e3', 't3')];
+    const state = derivePlaybackState(snapshot({
+      queue,
+      intents: [
+        intent({ kind: 'play', queueEntryId: 'e1', createdAtWallMs: 1000 }),
+        intent({ kind: 'skip-next', queueEntryId: 'e1', createdAtWallMs: 2000 }),
+        intent({ kind: 'skip-next', queueEntryId: 'e1', createdAtWallMs: 3000 }),
+      ],
+    }));
+    expect(state.queueEntryId).toBe('e2');
+    expect(state.status).toBe('playing');
+  });
+
   it('skip-next at end of queue stops playback', () => {
     const queue = [entry('e1', 't1')];
     const state = derivePlaybackState(snapshot({

@@ -450,6 +450,10 @@ function PlaybackPanel({
     gestureUnlock();
     room.skipPrevious();
   }
+  function onTrackEnded() {
+    if (derived.status !== 'playing' || !derived.queueEntryId) return;
+    room.skipNext({ fromEntryId: derived.queueEntryId });
+  }
   function onSelectViaSeek(targetMs: number) {
     gestureUnlock();
     room.seek(targetMs);
@@ -490,6 +494,7 @@ function PlaybackPanel({
         ref={audioRef}
         src={playUrl ?? undefined}
         preload="auto"
+        onEnded={onTrackEnded}
         onError={() => {
           const err = audioRef.current?.error;
           // MEDIA_ERR_ABORTED (1) fires when src changes mid-fetch — that's
