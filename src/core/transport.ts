@@ -6,8 +6,9 @@
 export type RemotePeerId = string;
 
 // Channel names are short — Trystero limits action ids to 12 bytes.
-export type ChannelName = 'sv' | 'up' | 'aw';
-export const CHANNELS: readonly ChannelName[] = ['sv', 'up', 'aw'];
+// sv/up/aw are Yjs provider traffic; mr/mc are mesh media request/chunk.
+export type ChannelName = 'sv' | 'up' | 'aw' | 'mr' | 'mc';
+export const CHANNELS: readonly ChannelName[] = ['sv', 'up', 'aw', 'mr', 'mc'];
 
 export interface Transport {
   readonly localPeerId: RemotePeerId;

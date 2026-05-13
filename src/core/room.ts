@@ -3,7 +3,7 @@
 // directly. Per DESIGN.md §15.1, every command runs in a single Y transaction
 // and appends an activity record.
 //
-// Media is grouped into Batches (one .torrent per drop). Tracks reference a
+// Media is grouped into Batches (one batch per drop). Tracks reference a
 // (batchId, fileIndex). See DESIGN.md §6 / types.ts.
 
 import * as Y from 'yjs';
@@ -41,7 +41,7 @@ export type RoomOptions = {
   now?: () => number;
 };
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export class JamboreeRoom {
   readonly doc: Y.Doc;
@@ -118,17 +118,16 @@ export class JamboreeRoom {
 
   // --- batch / track commands -----------------------------------------------
 
-  // Adds a Batch by infoHash. If a batch with the same infoHash already
+  // Adds a Batch by contentId. If a batch with the same contentId already
   // exists, returns its id without re-adding — drag-and-drop of the same
   // file twice should converge, not duplicate.
   addBatch(input: NewBatchInput): BatchId {
-    const existing = this.findBatchByInfoHash(input.infoHash);
+    const existing = this.findBatchByContentId(input.contentId);
     if (existing) return existing.id;
     const id = input.id ?? randomId('batch');
     const batch: Batch = {
       id,
-      infoHash: input.infoHash,
-      torrentFileBase64: input.torrentFileBase64,
+      contentId: input.contentId,
       files: input.files,
       addedByPeerId: this.peerId,
       addedAt: this.now(),
@@ -315,9 +314,9 @@ export class JamboreeRoom {
 
   // --- internals -------------------------------------------------------------
 
-  private findBatchByInfoHash(infoHash: string): Batch | undefined {
+  private findBatchByContentId(contentId: string): Batch | undefined {
     for (const batch of this.batchesMap().values()) {
-      if (batch.infoHash === infoHash) return batch;
+      if (batch.contentId === contentId) return batch;
     }
     return undefined;
   }

@@ -1,28 +1,24 @@
-// MediaCache: thin wrapper around a single browser WebTorrent client. Media
-// is organised into Batches — one .torrent per drop/import, addressable by
-// infoHash, with N audio files inside. The Yjs doc carries the .torrent bytes
-// (base64), so receivers don't have to wait on metadata exchange and can
-// surface the file list immediately.
+// MediaCache: media blob exchange over the existing Trystero peer mesh.
 //
-// Receivers add each batch with `deselect: true`, which leaves the piece
-// picker idle. Pieces are only requested for files we explicitly select. The
-// MediaCache selects at most two files at any moment: the active track (the
-// one playing) at HIGH priority, and one not-yet-ready upcoming track at LOW
-// priority for warmup. Everything else is metadata-only.
+// Content is identified by a SHA-256 based batch manifest id generated
+// during ingest. Receivers request whole-file chunks from any connected peer
+// that has the blob; once a file is complete it is stored as a Blob URL and
+// can be re-served to later peers.
 //
-// Two URL paths, decided per entry:
-//   - Receivers use `file.streamURL`, served by WebTorrent's prebuilt SW
-//     (registered in main.tsx and passed in via swRegistration). Range
-//     requests resolve against the chunk store as pieces arrive.
-//   - Seeders use a plain object URL on the source File. We already have
-//     the bytes in memory, so we skip the SW round-trip entirely.
+// The protocol is deliberately small:
+//   - `mr`: request one byte range for (batch id, file index)
+//   - `mc`: respond with that range
+//
+// Peers broadcast requests. Any holder may answer; duplicates are ignored.
+// Downloads are file-granular and sequential because the UI only needs the
+// active track and one upcoming track. The protocol is deliberately less
+// clever than a content swarm, and easier to reason about in our room mesh.
 
-import WebTorrent from 'webtorrent';
 import type { BatchFile } from './types.ts';
+import type { RemotePeerId, Transport } from './transport.ts';
 
 export type SeededBatch = {
-  infoHash: string;
-  torrentFileBase64: string;
+  contentId: string;
   files: BatchFile[];
 };
 
@@ -30,8 +26,7 @@ export type FileStatus =
   | { kind: 'unknown' }
   | { kind: 'pending'; numPeers: number }
   | {
-      kind: 'streaming';
-      url: string;
+      kind: 'downloading';
       progress: number;
       bytesDownloaded: number;
       bytesTotal: number;
@@ -44,340 +39,213 @@ export type FileStatus =
       numPeers: number;
     };
 
-export type FileRef = { infoHash: string; fileIndex: number };
+export type FileRef = { contentId: string; fileIndex: number };
 
 type Entry = {
-  torrent: WebTorrent.Torrent;
-  kind: 'add' | 'seed';
-  startedAtMs: number;
-  // For seeds: per-fileIndex object URL on the source File. Built eagerly so
-  // playback can short-circuit straight to <audio src=...> without hitting
-  // the SW or the chunk store.
-  seedObjectUrls: Map<number, string>;
-  // Selections currently applied to the torrent's piece picker, indexed by
-  // fileIndex. The value is the priority that was passed to file.select().
-  // Tracked so a re-select with a different priority can deselect cleanly,
-  // rather than stacking duplicate selections inside WebTorrent.
-  selections: Map<number, number>;
-  lastProgressLogMs?: number;
-  lastProgressBytes?: number;
+  contentId: string;
+  files: BatchFile[];
+  records: Map<number, FileRecord>;
 };
 
-// Throttle subscriber notifications. WebTorrent emits 'download' on every
-// piece; the UI only needs ~4Hz to feel responsive.
+type FileRecord = {
+  meta: BatchFile;
+  source?: Blob;
+  objectUrl?: string;
+  buffer?: Uint8Array;
+  downloaded: number;
+  download?: DownloadState;
+};
+
+type DownloadState = {
+  requestId: string;
+  nextOffset: number;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+type RequestMessage = {
+  v: 1;
+  id: string;
+  c: string;
+  i: number;
+  o: number;
+  l: number;
+};
+
+type ChunkHeader = {
+  v: 1;
+  id: string;
+  c: string;
+  i: number;
+  o: number;
+  t: number;
+};
+
+const CHUNK_SIZE = 64 * 1024;
+const REQUEST_RETRY_MS = 1500;
 const NOTIFY_INTERVAL_MS = 250;
 
-// Per-file priorities. WebTorrent's piece picker treats higher numbers as
-// higher priority; selections accumulate per torrent. We layer two
-// selections at most: the currently-playing file (HIGH) and one upcoming
-// file (LOW). Everything else is deselected.
-const ACTIVE_PRIORITY = 5;
-const UPCOMING_PRIORITY = 2;
-
-// Diagnostic: how often to log download throughput while pieces are arriving.
-const PROGRESS_LOG_INTERVAL_MS = 2000;
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 export class MediaCache {
-  private readonly client: WebTorrent.Instance;
-  private readonly trackers: string[] | undefined;
+  private readonly transport: Transport | null;
   private readonly entries = new Map<string, Entry>();
   private readonly listeners = new Set<() => void>();
+  private readonly unsubs: Array<() => void> = [];
+  private readonly remotePeers = new Set<RemotePeerId>();
   private notifyTimer: ReturnType<typeof setTimeout> | null = null;
   private destroyed = false;
-
-  // Pending addBatchFromDoc promises, keyed by infoHash, so concurrent calls
-  // for the same batch coalesce instead of racing into duplicate-add errors.
-  private readonly pendingAdds = new Map<string, Promise<void>>();
 
   private active: FileRef | null = null;
   private upcoming: FileRef | null = null;
 
-  constructor(opts: {
-    client?: WebTorrent.Instance;
-    trackers?: string[];
-    swRegistration?: ServiceWorkerRegistration | null;
-  } = {}) {
-    this.client = opts.client ?? new WebTorrent();
-    this.trackers = opts.trackers && opts.trackers.length > 0 ? opts.trackers : undefined;
-    if (opts.swRegistration) {
-      // Streaming server: routes file.streamURL fetches through the SW into
-      // WebTorrent's chunk store. Without this, receivers have no way to
-      // play a track. (Seeds still play via seedObjectUrls.)
-      try {
-        (this.client as unknown as {
-          createServer(o: { controller: ServiceWorkerRegistration }): unknown;
-        }).createServer({ controller: opts.swRegistration });
-      } catch (err) {
-        console.warn('[jamboree] WebTorrent createServer failed', err);
-      }
+  constructor(opts: { transport?: Transport } = {}) {
+    this.transport = opts.transport ?? null;
+    if (this.transport) {
+      this.unsubs.push(this.transport.onPeerJoin(this.handlePeerJoin));
+      this.unsubs.push(this.transport.onPeerLeave(this.handlePeerLeave));
+      this.unsubs.push(this.transport.receive('mr', this.handleRequest));
+      this.unsubs.push(this.transport.receive('mc', this.handleChunk));
     }
   }
 
-  // --- ingestion -------------------------------------------------------------
+  // --- ingestion -----------------------------------------------------------
 
-  // Seed a batch of local files as one multi-file torrent (or a single-file
-  // torrent if files.length === 1). Resolves once the torrent is ready and
-  // its .torrent file has been built. The caller writes the SeededBatch into
-  // the Yjs doc as a Batch entry.
-  seedBatch(files: File[]): Promise<SeededBatch> {
-    if (this.destroyed) return Promise.reject(new Error('MediaCache destroyed'));
-    if (files.length === 0) {
-      return Promise.reject(new Error('seedBatch: no files'));
-    }
+  async seedBatch(files: File[]): Promise<SeededBatch> {
+    if (this.destroyed) throw new Error('MediaCache destroyed');
+    if (files.length === 0) throw new Error('seedBatch: no files');
+
     mediaLog('seedBatch:start', { count: files.length });
     const startedAtMs = performance.now();
-    return new Promise<SeededBatch>((resolve, reject) => {
-      let settled = false;
-      const settle = (action: () => void) => {
-        if (settled) return;
-        settled = true;
-        action();
-      };
-      try {
-        // WebTorrent.seed accepts File[] but @types/webtorrent only types
-        // single-File. Cast through unknown.
-        type SeedFn = (
-          input: File[],
-          opts: { announce?: string[] },
-          onseed: (t: WebTorrent.Torrent) => void,
-        ) => WebTorrent.Torrent;
-        const seedFn = this.client.seed as unknown as SeedFn;
-        const torrent = seedFn.call(
-          this.client,
-          files,
-          { announce: this.trackers },
-          (seeded) => {
-            // onseed fires both on first-time seed (seeded === torrent) and
-            // on duplicate-content (seeded is the pre-existing torrent and
-            // WebTorrent silently destroyed ours). Either way we register and
-            // resolve from the surviving torrent.
-            settle(() => {
-              this.register(seeded, 'seed', files, startedAtMs)
-                .then(resolve, reject);
-            });
-          },
-        );
-        torrent.on('error', (err: Error | string) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          const dup = parseDuplicate(msg);
-          if (dup && this.entries.has(dup)) {
-            // Re-seeding the same content: resolve to the existing entry.
-            settle(() => {
-              this.toSeededBatch(this.entries.get(dup)!.torrent).then(resolve, reject);
-            });
-            return;
-          }
-          settle(() => reject(err instanceof Error ? err : new Error(msg)));
-        });
-      } catch (err) {
-        settle(() => reject(err instanceof Error ? err : new Error(String(err))));
-      }
-    });
-  }
+    const fileHashes = await Promise.all(files.map(hashBlobHex));
+    const contentId = await hashContentId(files, fileHashes);
+    const batchFiles: BatchFile[] = files.map((f, i) => ({
+      path: f.name,
+      name: f.name,
+      size: f.size,
+      mime: f.type || mimeFromFileName(f.name),
+      sha256: fileHashes[i],
+    }));
 
-  // Receive a batch by its .torrent bytes (from the Yjs doc). Adds with
-  // deselect:true so no pieces are requested until the caller selects a
-  // file via setActive / setUpcoming. Idempotent on infoHash; concurrent
-  // calls for the same batch coalesce.
-  addBatchFromDoc(batch: { infoHash: string; torrentFileBase64: string }): Promise<void> {
-    if (this.destroyed) return Promise.reject(new Error('MediaCache destroyed'));
-    if (this.entries.has(batch.infoHash)) return Promise.resolve();
-    const existing = this.pendingAdds.get(batch.infoHash);
-    if (existing) return existing;
-    const p = this.doAddBatchFromDoc(batch).finally(() => {
-      this.pendingAdds.delete(batch.infoHash);
+    const entry = this.ensureEntry(contentId, batchFiles);
+    files.forEach((file, i) => {
+      const rec = this.ensureRecord(entry, i);
+      rec.source = file;
+      rec.downloaded = file.size;
+      if (!rec.objectUrl) rec.objectUrl = URL.createObjectURL(file);
+      this.cancelDownload(rec);
     });
-    this.pendingAdds.set(batch.infoHash, p);
-    return p;
-  }
+    mediaLog('seedBatch:ready', {
+      hash: shortId(contentId),
+      dt: dtSec(startedAtMs),
+      files: files.length,
+    });
+    this.scheduleNotify();
 
-  private async doAddBatchFromDoc(batch: {
-    infoHash: string;
-    torrentFileBase64: string;
-  }): Promise<void> {
-    mediaLog('addBatch:start', { hash: shortHash(batch.infoHash) });
-    const startedAtMs = performance.now();
-    let bytes: Uint8Array;
-    try {
-      bytes = base64ToUint8(batch.torrentFileBase64);
-    } catch (err) {
-      throw new Error(
-        `addBatchFromDoc: invalid base64 (${err instanceof Error ? err.message : String(err)})`,
-      );
-    }
-    // Cast: @types/webtorrent doesn't expose the deselect/strategy options.
-    type AddOpts = {
-      announce?: string[];
-      deselect?: boolean;
-      strategy?: 'sequential' | 'rarest';
+    return {
+      contentId,
+      files: batchFiles,
     };
-    type AddFn = (torrentId: Uint8Array, opts: AddOpts) => WebTorrent.Torrent;
-    const addFn = this.client.add as unknown as AddFn;
-    let torrent: WebTorrent.Torrent;
-    try {
-      torrent = addFn.call(this.client, bytes, {
-        announce: this.trackers,
-        deselect: true,
-        strategy: 'sequential',
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const dup = parseDuplicate(msg);
-      if (dup && this.entries.has(dup)) return;
-      throw err instanceof Error ? err : new Error(msg);
-    }
-    await this.register(torrent, 'add', undefined, startedAtMs);
   }
 
-  // --- active/upcoming -------------------------------------------------------
+  addBatchFromDoc(batch: {
+    contentId: string;
+    files?: readonly BatchFile[];
+  }): Promise<void> {
+    if (this.destroyed) return Promise.reject(new Error('MediaCache destroyed'));
+    if (this.entries.has(batch.contentId)) return Promise.resolve();
+    if (!batch.files) {
+      return Promise.reject(new Error('addBatchFromDoc: missing file list'));
+    }
+    this.ensureEntry(batch.contentId, batch.files);
+    this.reconcileDownloads();
+    this.scheduleNotify();
+    return Promise.resolve();
+  }
 
-  // Mark the file currently being played (HIGH priority) and one upcoming
-  // queue file (LOW priority warmup). Either may be null. Safe to call before
-  // the relevant batches have been added — the selections will be applied as
-  // soon as their torrent is registered.
+  // --- active/upcoming -----------------------------------------------------
+
   setActive(target: FileRef | null): void {
     if (sameRef(this.active, target)) return;
     this.active = target;
-    this.reconcileSelections();
+    this.reconcileDownloads();
   }
 
   setUpcoming(target: FileRef | null): void {
     if (sameRef(this.upcoming, target)) return;
     this.upcoming = target;
-    this.reconcileSelections();
+    this.reconcileDownloads();
   }
 
-  // Walk every entry, compute the desired selection priority per fileIndex,
-  // and call select/deselect to converge. Called whenever active or upcoming
-  // changes, and on torrent registration so a new batch picks up the right
-  // selections without the caller having to re-set them.
-  private reconcileSelections(): void {
-    const desired = this.desiredSelections();
-    for (const [infoHash, entry] of this.entries) {
-      if (entry.kind !== 'add') continue; // seeds have all bytes already
-      const want = desired.get(infoHash) ?? new Map();
-      this.applyEntrySelections(entry, want);
+  private reconcileDownloads(): void {
+    const wanted = new Set<string>();
+    if (this.active) wanted.add(refKey(this.active.contentId, this.active.fileIndex));
+    if (this.upcoming) {
+      wanted.add(refKey(this.upcoming.contentId, this.upcoming.fileIndex));
     }
-  }
 
-  private desiredSelections(): Map<string, Map<number, number>> {
-    const out = new Map<string, Map<number, number>>();
-    const put = (ref: FileRef, priority: number) => {
-      let m = out.get(ref.infoHash);
-      if (!m) {
-        m = new Map();
-        out.set(ref.infoHash, m);
+    for (const entry of this.entries.values()) {
+      for (const [fileIndex, rec] of entry.records) {
+        const key = refKey(entry.contentId, fileIndex);
+        if (wanted.has(key)) this.startOrResumeDownload(entry, fileIndex, rec);
+        else this.cancelDownload(rec);
       }
-      // Active wins over upcoming when both point at the same file (active
-      // is iterated first in apply()), but we still record only the higher
-      // priority here so the diff at apply() time is correct.
-      const cur = m.get(ref.fileIndex);
-      if (cur === undefined || priority > cur) m.set(ref.fileIndex, priority);
+    }
+  }
+
+  private startOrResumeDownload(
+    entry: Entry,
+    fileIndex: number,
+    rec: FileRecord,
+  ): void {
+    if (rec.source) return;
+    if (!this.transport) return;
+    if (rec.downloaded >= rec.meta.size && rec.objectUrl) return;
+    if (!rec.buffer) rec.buffer = new Uint8Array(rec.meta.size);
+    if (rec.download) return;
+    rec.download = {
+      requestId: randomId('req'),
+      nextOffset: rec.downloaded,
+      timer: null,
     };
-    if (this.active) put(this.active, ACTIVE_PRIORITY);
-    if (this.upcoming) put(this.upcoming, UPCOMING_PRIORITY);
-    return out;
+    this.requestNextChunk(entry, fileIndex, rec);
   }
 
-  private applyEntrySelections(entry: Entry, want: Map<number, number>): void {
-    // Deselect files we no longer want, or whose priority changed.
-    for (const [fileIndex, prevPriority] of entry.selections) {
-      const nextPriority = want.get(fileIndex);
-      if (nextPriority === prevPriority) continue;
-      this.deselectFile(entry, fileIndex);
-    }
-    // Select (or re-select) files we now want.
-    for (const [fileIndex, priority] of want) {
-      if (entry.selections.get(fileIndex) === priority) continue;
-      this.selectFile(entry, fileIndex, priority);
-    }
+  private cancelDownload(rec: FileRecord): void {
+    if (!rec.download) return;
+    if (rec.download.timer) clearTimeout(rec.download.timer);
+    rec.download = undefined;
   }
 
-  private selectFile(entry: Entry, fileIndex: number, priority: number): void {
-    const file = entry.torrent.files[fileIndex];
-    if (!file) {
-      // Metadata not yet — registerOnce will reconcile on the 'ready' event.
-      return;
-    }
-    try {
-      (file as unknown as { select(priority: number): void }).select(priority);
-      entry.selections.set(fileIndex, priority);
-      mediaLog('select', {
-        hash: shortHash(entry.torrent.infoHash),
-        fileIndex,
-        priority,
-      });
-    } catch (err) {
-      mediaLog('select-failed', {
-        hash: shortHash(entry.torrent.infoHash),
-        fileIndex,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
+  // --- status queries ------------------------------------------------------
 
-  private deselectFile(entry: Entry, fileIndex: number): void {
-    const file = entry.torrent.files[fileIndex];
-    if (!file) {
-      entry.selections.delete(fileIndex);
-      return;
-    }
-    try {
-      (file as unknown as { deselect(): void }).deselect();
-    } catch (err) {
-      mediaLog('deselect-failed', {
-        hash: shortHash(entry.torrent.infoHash),
-        fileIndex,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-    entry.selections.delete(fileIndex);
-  }
-
-  // --- status queries --------------------------------------------------------
-
-  getStatus(infoHash: string, fileIndex: number): FileStatus {
-    const entry = this.entries.get(infoHash);
+  getStatus(contentId: string, fileIndex: number): FileStatus {
+    const entry = this.entries.get(contentId);
     if (!entry) return { kind: 'unknown' };
-    const torrent = entry.torrent;
-    const numPeers = torrent.numPeers;
-    // Seeder side: we have the bytes in memory.
-    const seedUrl = entry.seedObjectUrls.get(fileIndex);
-    if (seedUrl) {
-      const bytesTotal = torrent.files[fileIndex]?.length ?? 0;
-      return { kind: 'ready', url: seedUrl, bytesTotal, numPeers };
-    }
-    const file = torrent.files[fileIndex];
-    // For add() with the .torrent bytes inline, files[] is populated
-    // synchronously, so this is only ever falsy for malformed inputs.
-    if (!file) return { kind: 'pending', numPeers };
-    const streamUrl = (file as unknown as { streamURL?: string }).streamURL;
-    // No streamURL means the SW server isn't up (createServer failed or
-    // wasn't given a registration) — surface as pending so the UI doesn't
-    // claim playability.
-    if (!streamUrl) return { kind: 'pending', numPeers };
-    if (file.progress >= 1) {
-      return { kind: 'ready', url: streamUrl, bytesTotal: file.length, numPeers };
-    }
-    // We surface streaming even before any pieces arrive, as long as the file
-    // is selected — at that point streamURL is well-defined and an <audio>
-    // src will start fetching ranges via the SW.
-    if (file.progress > 0 || entry.selections.has(fileIndex)) {
+    const rec = entry.records.get(fileIndex);
+    const numPeers = this.remotePeers.size;
+    if (!rec) return { kind: 'pending', numPeers };
+    if (rec.objectUrl && rec.downloaded >= rec.meta.size) {
       return {
-        kind: 'streaming',
-        url: streamUrl,
-        progress: file.progress,
-        bytesDownloaded: file.downloaded,
-        bytesTotal: file.length,
+        kind: 'ready',
+        url: rec.objectUrl,
+        bytesTotal: rec.meta.size,
         numPeers,
       };
     }
-    // Known torrent, file exists, but we haven't selected it — no pieces
-    // will arrive. The UI should show "queued, not yet warmed".
+    if (rec.downloaded > 0 || rec.download) {
+      return {
+        kind: 'downloading',
+        progress: progressOf(rec),
+        bytesDownloaded: rec.downloaded,
+        bytesTotal: rec.meta.size,
+        numPeers,
+      };
+    }
     return { kind: 'pending', numPeers };
   }
 
-  // --- subscription / lifecycle ---------------------------------------------
+  // --- subscription / lifecycle -------------------------------------------
 
   subscribe(listener: () => void): () => void {
     this.listeners.add(listener);
@@ -389,186 +257,162 @@ export class MediaCache {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    if (this.notifyTimer) {
-      clearTimeout(this.notifyTimer);
-      this.notifyTimer = null;
-    }
+    if (this.notifyTimer) clearTimeout(this.notifyTimer);
+    for (const unsub of this.unsubs) unsub();
+    this.unsubs.length = 0;
     for (const entry of this.entries.values()) {
-      for (const url of entry.seedObjectUrls.values()) {
-        try {
-          URL.revokeObjectURL(url);
-        } catch {
-          // ignore
-        }
+      for (const rec of entry.records.values()) {
+        this.cancelDownload(rec);
+        if (rec.objectUrl) URL.revokeObjectURL(rec.objectUrl);
       }
     }
     this.entries.clear();
-    this.pendingAdds.clear();
     this.listeners.clear();
+  }
+
+  // --- protocol handlers ---------------------------------------------------
+
+  private handlePeerJoin = (peerId: RemotePeerId): void => {
+    this.remotePeers.add(peerId);
+    this.scheduleNotify();
+  };
+
+  private handlePeerLeave = (peerId: RemotePeerId): void => {
+    this.remotePeers.delete(peerId);
+    this.scheduleNotify();
+  };
+
+  private handleRequest = (peerId: RemotePeerId, payload: Uint8Array): void => {
+    if (this.destroyed || !this.transport) return;
+    let req: RequestMessage;
     try {
-      this.client.destroy();
+      req = JSON.parse(textDecoder.decode(payload)) as RequestMessage;
     } catch {
-      // destroy on a half-initialised client may throw — non-fatal.
+      return;
     }
+    if (!validRequest(req)) return;
+    const rec = this.entries.get(req.c)?.records.get(req.i);
+    if (!rec?.source) return;
+    const start = clamp(req.o, 0, rec.source.size);
+    const end = clamp(req.o + req.l, start, rec.source.size);
+    void rec.source.slice(start, end).arrayBuffer().then((buf) => {
+      if (this.destroyed || !this.transport) return;
+      const header: ChunkHeader = {
+        v: 1,
+        id: req.id,
+        c: req.c,
+        i: req.i,
+        o: start,
+        t: rec.source!.size,
+      };
+      this.transport.send('mc', encodeChunk(header, new Uint8Array(buf)), peerId);
+    });
+  };
+
+  private handleChunk = (_peerId: RemotePeerId, payload: Uint8Array): void => {
+    if (this.destroyed) return;
+    let decoded: { header: ChunkHeader; bytes: Uint8Array };
+    try {
+      decoded = decodeChunk(payload);
+    } catch {
+      return;
+    }
+    const { header, bytes } = decoded;
+    if (!validChunkHeader(header)) return;
+    const entry = this.entries.get(header.c);
+    const rec = entry?.records.get(header.i);
+    if (!entry || !rec?.download) return;
+    if (rec.download.requestId !== header.id) return;
+    if (!rec.buffer || header.o !== rec.download.nextOffset) return;
+    if (header.o + bytes.byteLength > rec.buffer.byteLength) return;
+
+    if (rec.download.timer) clearTimeout(rec.download.timer);
+    rec.download.timer = null;
+    rec.buffer.set(bytes, header.o);
+    rec.downloaded = Math.max(rec.downloaded, header.o + bytes.byteLength);
+    this.scheduleNotify();
+
+    if (rec.downloaded >= rec.meta.size) {
+      void this.finishDownload(rec);
+      return;
+    }
+    rec.download.nextOffset = rec.downloaded;
+    this.requestNextChunk(entry, header.i, rec);
+  };
+
+  private requestNextChunk(entry: Entry, fileIndex: number, rec: FileRecord): void {
+    if (!this.transport || !rec.download) return;
+    const offset = rec.download.nextOffset;
+    const length = Math.min(CHUNK_SIZE, Math.max(0, rec.meta.size - offset));
+    if (length <= 0) {
+      void this.finishDownload(rec);
+      return;
+    }
+    const req: RequestMessage = {
+      v: 1,
+      id: rec.download.requestId,
+      c: entry.contentId,
+      i: fileIndex,
+      o: offset,
+      l: length,
+    };
+    this.transport.send('mr', textEncoder.encode(JSON.stringify(req)));
+    rec.download.timer = setTimeout(() => {
+      if (!rec.download) return;
+      this.requestNextChunk(entry, fileIndex, rec);
+    }, REQUEST_RETRY_MS);
   }
 
-  // --- internals -------------------------------------------------------------
-
-  // Register an entry for a freshly-created torrent (seed or add). Resolves
-  // once metadata is in hand so seedBatch's caller has a SeededBatch to
-  // write into the doc. For add() we already have metadata embedded in the
-  // .torrent bytes, so this resolves nearly immediately.
-  private register(
-    torrent: WebTorrent.Torrent,
-    kind: 'add' | 'seed',
-    seedFiles: File[] | undefined,
-    startedAtMs: number,
-  ): Promise<SeededBatch> {
-    const infoHash = torrent.infoHash;
-    if (infoHash && this.entries.has(infoHash)) {
-      // Duplicate path: WebTorrent handed us the existing torrent. Re-use the
-      // existing entry's seed URLs (we may be re-seeding the same files).
-      return this.toSeededBatch(this.entries.get(infoHash)!.torrent);
-    }
-    const seedObjectUrls = new Map<number, string>();
-    if (seedFiles) {
-      // Build object URLs eagerly. Order matches the seed input, which is
-      // also the order WebTorrent assigns to torrent.files[]. (For multi-file
-      // seeds, WebTorrent stable-sorts by path; using file.name as the path
-      // means input order is preserved.)
-      seedFiles.forEach((f, i) => {
-        seedObjectUrls.set(i, URL.createObjectURL(f));
-      });
-    }
-    const entry: Entry = {
-      torrent,
-      kind,
-      startedAtMs,
-      seedObjectUrls,
-      selections: new Map(),
-    };
-    const log = (event: string, extra?: Record<string, unknown>) =>
-      mediaLog(`${kind}:${event}`, {
-        hash: shortHash(torrent.infoHash),
-        dt: dtSec(startedAtMs),
-        peers: torrent.numPeers,
-        ...extra,
-      });
-    log('register');
-
-    const finishRegistration = () => {
-      if (this.entries.has(torrent.infoHash)) return;
-      this.entries.set(torrent.infoHash, entry);
-      // A previously-set active/upcoming may apply to this batch.
-      this.reconcileSelections();
-    };
-
-    if (infoHash) finishRegistration();
-    else torrent.once('infoHash', finishRegistration);
-
-    torrent.on('download', () => {
-      this.logProgress(entry);
-      this.scheduleNotify();
-    });
-    torrent.on('upload', () => this.scheduleNotify());
-    // @types/webtorrent's overload set excludes 'wire' — cast through unknown.
-    (torrent.on as unknown as (
-      event: 'wire',
-      h: (wire: { remoteAddress?: string }) => void,
-    ) => void).call(torrent, 'wire', (wire) => {
-      log('wire', { addr: wire.remoteAddress });
-      this.scheduleNotify();
-    });
-    torrent.on('done', () => {
-      log('done');
-      this.scheduleNotify();
-    });
-    torrent.on('ready', () => {
-      log('ready', { files: torrent.files.map((f) => f.name) });
-      // Selections may have been queued before files[] was populated; apply
-      // them now.
-      this.reconcileSelections();
-      this.scheduleNotify();
-    });
-    torrent.on('noPeers', (announceType: string) =>
-      log('noPeers', { announceType }),
-    );
-    torrent.on('error', (e: Error | string) => {
-      log('error', { msg: e instanceof Error ? e.message : String(e) });
-      this.scheduleNotify();
-    });
-    torrent.on('warning', (w: Error | string) => {
-      const msg = w instanceof Error ? w.message : String(w);
-      console.warn(
-        `[jam/wt ${shortHash(torrent.infoHash)} +${dtSec(startedAtMs)}s] ${kind}:warning`,
-        msg,
-      );
-    });
-    return this.toSeededBatch(torrent);
-  }
-
-  private toSeededBatch(torrent: WebTorrent.Torrent): Promise<SeededBatch> {
-    return new Promise((resolve, reject) => {
-      const onReady = () => {
-        cleanup();
-        try {
-          const tBytes = (torrent as unknown as { torrentFile: Uint8Array }).torrentFile;
-          const files: BatchFile[] = torrent.files.map((f) => ({
-            // f.path is the in-torrent path (matches single-file vs multi-file
-            // layout). f.name is the display basename.
-            path: (f as unknown as { path: string }).path ?? f.name,
-            name: f.name,
-            size: f.length,
-            mime: mimeFromFileName(f.name),
-          }));
-          resolve({
-            infoHash: torrent.infoHash,
-            torrentFileBase64: uint8ToBase64(tBytes),
-            files,
-          });
-        } catch (err) {
-          reject(err instanceof Error ? err : new Error(String(err)));
-        }
-      };
-      const onError = (err: Error | string) => {
-        cleanup();
-        reject(typeof err === 'string' ? new Error(err) : err);
-      };
-      const cleanup = () => {
-        torrent.off('ready', onReady);
-        torrent.off('error', onError);
-      };
-      if (torrent.ready) onReady();
-      else {
-        torrent.on('ready', onReady);
-        torrent.on('error', onError);
+  private async finishDownload(rec: FileRecord): Promise<void> {
+    if (!rec.buffer) return;
+    this.cancelDownload(rec);
+    const expectedHash = rec.meta.sha256;
+    if (expectedHash) {
+      const actualHash = await hashBytesHex(rec.buffer);
+      if (actualHash !== expectedHash) {
+        mediaLog('download:hash-mismatch', { expectedHash, actualHash });
+        rec.buffer = undefined;
+        rec.downloaded = 0;
+        this.scheduleNotify();
+        this.reconcileDownloads();
+        return;
       }
+    }
+    const blob = new Blob([arrayBufferFromBytes(rec.buffer)], {
+      type: rec.meta.mime || mimeFromFileName(rec.meta.name),
     });
+    rec.source = blob;
+    if (rec.objectUrl) URL.revokeObjectURL(rec.objectUrl);
+    rec.objectUrl = URL.createObjectURL(blob);
+    rec.downloaded = rec.meta.size;
+    rec.buffer = undefined;
+    mediaLog('download:ready', { name: rec.meta.name, bytes: rec.meta.size });
+    this.scheduleNotify();
   }
 
-  // Throttled per-torrent throughput log. Records bytes-downloaded at each
-  // tick and reports the delta since the last tick, so the speed number is
-  // an observed average over the interval rather than WebTorrent's own
-  // exponential-moving-average `downloadSpeed`.
-  private logProgress(entry: Entry): void {
-    const now = performance.now();
-    const last = entry.lastProgressLogMs ?? entry.startedAtMs;
-    if (now - last < PROGRESS_LOG_INTERVAL_MS) return;
-    const torrent = entry.torrent;
-    const bytes = torrent.downloaded;
-    const lastBytes = entry.lastProgressBytes ?? 0;
-    const elapsedSec = (now - last) / 1000;
-    const bps = elapsedSec > 0 ? Math.round((bytes - lastBytes) / elapsedSec) : 0;
-    entry.lastProgressLogMs = now;
-    entry.lastProgressBytes = bytes;
-    mediaLog(`${entry.kind}:progress`, {
-      hash: shortHash(torrent.infoHash),
-      dt: dtSec(entry.startedAtMs),
-      progress: torrent.progress.toFixed(3),
-      kbps: Math.round(bps / 1024),
-      peers: torrent.numPeers,
-      downloadedKB: Math.round(bytes / 1024),
-    });
+  // --- entry helpers -------------------------------------------------------
+
+  private ensureEntry(contentId: string, files: readonly BatchFile[]): Entry {
+    const existing = this.entries.get(contentId);
+    if (existing) return existing;
+    const entry: Entry = {
+      contentId,
+      files: files.map((f) => ({ ...f })),
+      records: new Map(),
+    };
+    entry.files.forEach((_, i) => this.ensureRecord(entry, i));
+    this.entries.set(contentId, entry);
+    return entry;
+  }
+
+  private ensureRecord(entry: Entry, fileIndex: number): FileRecord {
+    const existing = entry.records.get(fileIndex);
+    if (existing) return existing;
+    const meta = entry.files[fileIndex];
+    if (!meta) throw new Error(`unknown fileIndex ${fileIndex}`);
+    const rec: FileRecord = { meta, downloaded: 0 };
+    entry.records.set(fileIndex, rec);
+    return rec;
   }
 
   private scheduleNotify(): void {
@@ -591,17 +435,110 @@ export class MediaCache {
 function sameRef(a: FileRef | null, b: FileRef | null): boolean {
   if (a === b) return true;
   if (!a || !b) return false;
-  return a.infoHash === b.infoHash && a.fileIndex === b.fileIndex;
+  return a.contentId === b.contentId && a.fileIndex === b.fileIndex;
 }
 
-function parseDuplicate(msg: string): string | null {
-  const m = /duplicate[^a-f0-9]*([a-f0-9]{40})/i.exec(msg);
-  return m ? m[1]!.toLowerCase() : null;
+function refKey(contentId: string, fileIndex: number): string {
+  return `${contentId}:${fileIndex}`;
+}
+
+function progressOf(rec: FileRecord): number {
+  if (rec.meta.size <= 0) return 1;
+  return Math.max(0, Math.min(1, rec.downloaded / rec.meta.size));
+}
+
+function validRequest(msg: RequestMessage): boolean {
+  return (
+    msg?.v === 1 &&
+    typeof msg.id === 'string' &&
+    typeof msg.c === 'string' &&
+    Number.isInteger(msg.i) &&
+    Number.isInteger(msg.o) &&
+    Number.isInteger(msg.l) &&
+    msg.i >= 0 &&
+    msg.o >= 0 &&
+    msg.l > 0
+  );
+}
+
+function validChunkHeader(h: ChunkHeader): boolean {
+  return (
+    h?.v === 1 &&
+    typeof h.id === 'string' &&
+    typeof h.c === 'string' &&
+    Number.isInteger(h.i) &&
+    Number.isInteger(h.o) &&
+    Number.isInteger(h.t) &&
+    h.i >= 0 &&
+    h.o >= 0 &&
+    h.t >= 0
+  );
+}
+
+function encodeChunk(header: ChunkHeader, bytes: Uint8Array): Uint8Array {
+  const headerBytes = textEncoder.encode(JSON.stringify(header));
+  const out = new Uint8Array(4 + headerBytes.byteLength + bytes.byteLength);
+  new DataView(out.buffer, out.byteOffset, out.byteLength).setUint32(
+    0,
+    headerBytes.byteLength,
+    false,
+  );
+  out.set(headerBytes, 4);
+  out.set(bytes, 4 + headerBytes.byteLength);
+  return out;
+}
+
+function decodeChunk(payload: Uint8Array): { header: ChunkHeader; bytes: Uint8Array } {
+  if (payload.byteLength < 4) throw new Error('chunk too small');
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const headerLen = view.getUint32(0, false);
+  if (payload.byteLength < 4 + headerLen) throw new Error('bad header length');
+  const headerBytes = payload.subarray(4, 4 + headerLen);
+  const header = JSON.parse(textDecoder.decode(headerBytes)) as ChunkHeader;
+  return { header, bytes: payload.subarray(4 + headerLen) };
+}
+
+async function hashContentId(files: File[], fileHashes: string[]): Promise<string> {
+  const manifest = files.map((f, i) => ({
+    name: f.name,
+    size: f.size,
+    type: f.type || mimeFromFileName(f.name),
+    sha256: fileHashes[i],
+  }));
+  const bytes = textEncoder.encode(JSON.stringify(manifest));
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+async function hashBlobHex(blob: Blob): Promise<string> {
+  return hashBytesHex(new Uint8Array(await blob.arrayBuffer()));
+}
+
+async function hashBytesHex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', arrayBufferFromBytes(bytes));
+  return bytesToHex(new Uint8Array(digest));
+}
+
+function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer {
+  return bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength,
+  ) as ArrayBuffer;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = '';
+  for (const b of bytes) out += b.toString(16).padStart(2, '0');
+  return out;
+}
+
+function randomId(prefix: string): string {
+  const bytes = new Uint8Array(8);
+  crypto.getRandomValues(bytes);
+  return `${prefix}-${bytesToHex(bytes)}`;
 }
 
 export function uint8ToBase64(bytes: Uint8Array): string {
-  // Chunked to avoid String.fromCharCode's argument-count limits on large
-  // inputs (~64KB+).
   const chunk = 0x8000;
   let s = '';
   for (let i = 0; i < bytes.length; i += chunk) {
@@ -640,14 +577,16 @@ function mimeFromFileName(name: string): string {
   }
 }
 
-// --- logging ---------------------------------------------------------------
-
-function mediaLog(event: string, fields: Record<string, unknown>): void {
-  console.log(`[jam/wt] ${event}`, fields);
+function clamp(n: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, n));
 }
 
-function shortHash(infoHash: string | undefined): string {
-  return infoHash ? infoHash.slice(0, 8) : '????????';
+function mediaLog(event: string, fields: Record<string, unknown>): void {
+  console.log(`[jam/media] ${event}`, fields);
+}
+
+function shortId(contentId: string | undefined): string {
+  return contentId ? contentId.slice(0, 8) : '????????';
 }
 
 function dtSec(startedAtMs: number): string {

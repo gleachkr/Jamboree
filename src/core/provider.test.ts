@@ -34,7 +34,7 @@ function makePeer(hub: FakeTransportHub, peerId: string): Peer {
 }
 
 let batchCounter = 0;
-function uniqueInfoHash(): string {
+function uniqueContentId(): string {
   batchCounter += 1;
   return batchCounter.toString(16).padStart(40, '0');
 }
@@ -42,8 +42,7 @@ function uniqueInfoHash(): string {
 function addOne(peer: Peer, title: string): { trackId: string; entryId: string } {
   const { trackIds, entryIds } = peer.room.addAndEnqueueBatch(
     {
-      infoHash: uniqueInfoHash(),
-      torrentFileBase64: '',
+      contentId: uniqueContentId(),
       files: [{ path: title, name: title, size: 1 }],
     },
     [{ title, fileIndex: 0 }],

@@ -8,8 +8,7 @@ type StatusKind = ReturnType<Parameters<typeof nextWarmupFileRef>[2]>['kind'];
 function batch(id: string): Batch {
   return {
     id,
-    infoHash: `${id}`.padEnd(40, id),
-    torrentFileBase64: '',
+    contentId: `${id}`.padEnd(40, id),
     files: [],
     addedByPeerId: 'peer_a',
     addedAt: 0,
@@ -52,8 +51,8 @@ function snapshot(ids: string[]): Snapshot {
 
 function statusMap(readyIds: string[]) {
   const ready = new Set(readyIds.map((id) => `${id}`.padEnd(40, id)));
-  return (infoHash: string, _fileIndex: number): { kind: StatusKind } => ({
-    kind: ready.has(infoHash) ? 'ready' : 'pending',
+  return (contentId: string, _fileIndex: number): { kind: StatusKind } => ({
+    kind: ready.has(contentId) ? 'ready' : 'pending',
   });
 }
 
@@ -62,7 +61,7 @@ describe('nextWarmupFileRef', () => {
     const snap = snapshot(['a', 'b', 'c']);
 
     expect(nextWarmupFileRef(snap, undefined, statusMap([]))).toEqual({
-      infoHash: 'a'.padEnd(40, 'a'),
+      contentId: 'a'.padEnd(40, 'a'),
       fileIndex: 0,
     });
   });
@@ -71,7 +70,7 @@ describe('nextWarmupFileRef', () => {
     const snap = snapshot(['a', 'b', 'c']);
 
     expect(nextWarmupFileRef(snap, 'a', statusMap([]))).toEqual({
-      infoHash: 'b'.padEnd(40, 'b'),
+      contentId: 'b'.padEnd(40, 'b'),
       fileIndex: 0,
     });
   });
@@ -80,7 +79,7 @@ describe('nextWarmupFileRef', () => {
     const snap = snapshot(['a', 'b', 'c', 'd']);
 
     expect(nextWarmupFileRef(snap, 'a', statusMap(['b', 'c']))).toEqual({
-      infoHash: 'd'.padEnd(40, 'd'),
+      contentId: 'd'.padEnd(40, 'd'),
       fileIndex: 0,
     });
   });

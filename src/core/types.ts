@@ -1,6 +1,6 @@
-// Shared room model types. Media is grouped into Batches: one .torrent per
-// drop/import, addressable by infoHash, with N audio files inside. A Track is
-// a thin reference to (batchId, fileIndex) plus presentation metadata.
+// Shared room model types. Media is grouped into Batches: one drop/import,
+// addressable by content id, with N audio files inside. A Track is a thin
+// reference to (batchId, fileIndex) plus presentation metadata.
 
 export type TrackId = string;
 export type BatchId = string;
@@ -10,22 +10,23 @@ export type ActivityId = string;
 export type PeerId = string;
 
 export type BatchFile = {
-  // Path inside the torrent. For a single-file batch this is just the
-  // filename; for a multi-file batch it's the per-file path WebTorrent
-  // reports on file.path.
+  // Path inside the dropped/imported batch. For local files this is usually
+  // just the filename; future directory import can preserve nested paths.
   path: string;
   name: string;
   size: number;
   mime?: string;
+  // Optional SHA-256 of this file's bytes. The mesh media protocol uses this
+  // to reject corrupt chunk responses before creating a playable Blob URL.
+  sha256?: string;
 };
 
-// A Batch holds the .torrent bytes for one drop. Receivers decode the bytes
-// directly into WebTorrent.add — they don't wait on metadata exchange, and
-// they don't have to download anything until a referenced track is selected.
+// A Batch holds metadata for one drop/import. `contentId` is a stable
+// SHA-256 based identifier for the batch manifest, used by the mesh media
+// protocol to request files from peers.
 export type Batch = {
   id: BatchId;
-  infoHash: string;
-  torrentFileBase64: string;
+  contentId: string;
   files: BatchFile[];
   addedByPeerId: PeerId;
   addedAt: number;

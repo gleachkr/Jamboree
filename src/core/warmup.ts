@@ -21,11 +21,11 @@ type WarmupStatus = Pick<FileStatus, 'kind'>;
 // This intentionally warms only one non-active file at a time. Once that file
 // reaches ready, the next render skips over it and selects the following
 // not-ready file. That gives us serial warmup down the upcoming queue without
-// diluting the active track's piece priority across many files at once.
+// spreading requests across many files at once.
 export function nextWarmupFileRef(
   snap: WarmupSnapshot,
   currentEntryId: QueueEntryId | undefined,
-  getStatus: (infoHash: string, fileIndex: number) => WarmupStatus,
+  getStatus: (contentId: string, fileIndex: number) => WarmupStatus,
 ): FileRef | null {
   if (snap.queue.length === 0) return null;
 
@@ -44,8 +44,8 @@ export function nextWarmupFileRef(
     if (!meta) continue;
     const batch = snap.batches.get(meta.batchId);
     if (!batch) continue;
-    if (getStatus(batch.infoHash, meta.fileIndex).kind === 'ready') continue;
-    return { infoHash: batch.infoHash, fileIndex: meta.fileIndex };
+    if (getStatus(batch.contentId, meta.fileIndex).kind === 'ready') continue;
+    return { contentId: batch.contentId, fileIndex: meta.fileIndex };
   }
 
   return null;

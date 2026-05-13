@@ -8,10 +8,10 @@ function syncBoth(a: JamboreeRoom, b: JamboreeRoom): void {
   Y.applyUpdate(a.doc, Y.encodeStateAsUpdate(b.doc), 'remote');
 }
 
-// Unique infoHash per call so addBatch doesn't dedupe across distinct test
-// tracks. Valid hex of length 40 (mirrors a real BitTorrent infoHash).
+// Unique contentId per call so addBatch doesn't dedupe across distinct
+// test tracks.
 let batchCounter = 0;
-function uniqueInfoHash(): string {
+function uniqueContentId(): string {
   batchCounter += 1;
   return batchCounter.toString(16).padStart(40, '0');
 }
@@ -25,8 +25,7 @@ function addOne(
 ): { trackId: TrackId; entryId: QueueEntryId } {
   const { trackIds, entryIds } = room.addAndEnqueueBatch(
     {
-      infoHash: uniqueInfoHash(),
-      torrentFileBase64: '',
+      contentId: uniqueContentId(),
       files: [{ path: title, name: title, size: 1 }],
     },
     [{ title, fileIndex: 0 }],
@@ -39,8 +38,7 @@ describe('JamboreeRoom — single-peer commands', () => {
     const room = new JamboreeRoom({ peerId: 'peer_a' });
     const { batchId, trackIds, entryIds } = room.addAndEnqueueBatch(
       {
-        infoHash: uniqueInfoHash(),
-        torrentFileBase64: '',
+        contentId: uniqueContentId(),
         files: [{ path: 'Hello.mp3', name: 'Hello.mp3', size: 1 }],
       },
       [{ title: 'Hello', fileIndex: 0 }],
@@ -54,17 +52,15 @@ describe('JamboreeRoom — single-peer commands', () => {
     expect(snap.queue[0]!.trackId).toBe(trackIds[0]!);
   });
 
-  it('addBatch is idempotent on infoHash', () => {
+  it('addBatch is idempotent on contentId', () => {
     const room = new JamboreeRoom();
-    const sharedHash = uniqueInfoHash();
+    const sharedContentId = uniqueContentId();
     const id1 = room.addBatch({
-      infoHash: sharedHash,
-      torrentFileBase64: '',
+      contentId: sharedContentId,
       files: [{ path: 'a.mp3', name: 'a.mp3', size: 1 }],
     });
     const id2 = room.addBatch({
-      infoHash: sharedHash,
-      torrentFileBase64: '',
+      contentId: sharedContentId,
       files: [{ path: 'a.mp3', name: 'a.mp3', size: 1 }],
     });
     expect(id1).toBe(id2);
@@ -79,7 +75,7 @@ describe('JamboreeRoom — single-peer commands', () => {
       { path: 'c.mp3', name: 'c.mp3', size: 1 },
     ];
     const { batchId, trackIds, entryIds } = room.addAndEnqueueBatch(
-      { infoHash: uniqueInfoHash(), torrentFileBase64: '', files },
+      { contentId: uniqueContentId(), files },
       [
         { title: 'A', fileIndex: 0 },
         { title: 'B', fileIndex: 1 },

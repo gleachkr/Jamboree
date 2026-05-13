@@ -1,19 +1,22 @@
-// Trystero adapter for the Transport interface. Uses the BitTorrent tracker
-// strategy by default rather than Nostr (which DESIGN.md §2 originally
-// proposed): Nostr public relays rate-limit our signaling traffic ("you are
-// noting too much" from Damus, etc.), while WebTorrent trackers are
-// purpose-built for high-frequency WebRTC signaling and don't push back on
-// reasonable announce volumes. The room password is the URL-fragment key
-// from the invite — both the rendezvous secret and the implicit capability.
+// Trystero adapter for the Transport interface. Uses Trystero's BitTorrent
+// tracker strategy for rendezvous signaling. We intentionally do not pass a
+// pinned relay list here while debugging discovery, so Trystero uses its own
+// default tracker set. The room password is the URL-fragment key from the
+// invite — both the rendezvous secret and the implicit capability.
 //
 // We deliberately keep this file thin: all protocol logic lives in
 // provider.ts and is tested against the FakeTransportHub. This file only
 // translates between the Transport interface and Trystero's room API.
 
-import { joinRoom, selfId } from '@trystero-p2p/torrent';
+import {
+  getRelaySockets,
+  joinRoom,
+  selfId,
+} from '@trystero-p2p/torrent';
 import type {
   ActionReceiver,
   ActionSender,
+  JoinRoomCallbacks,
   Room,
 } from '@trystero-p2p/core';
 import {
@@ -32,9 +35,9 @@ export type TrysteroTransportOptions = {
   // Application identifier used to namespace this app on the rendezvous
   // network (so we don't see traffic from other Trystero apps).
   appId?: string;
-  // Override the rendezvous relays. Defaults to Trystero's built-in
-  // WebTorrent tracker list (tracker.webtorrent.dev, openwebtorrent, etc.).
-  // Cross-NAT calls may also need a TURN server passed via turnConfig.
+  // Override the rendezvous relays. Leave undefined to use Trystero's
+  // built-in BitTorrent tracker set. Cross-NAT calls may also need a TURN
+  // server passed via turnConfig.
   relayUrls?: string[];
   turnConfig?: Array<{
     urls: string | string[];
@@ -45,23 +48,52 @@ export type TrysteroTransportOptions = {
 
 const DEFAULT_APP_ID = 'jamboree.app';
 
-export function joinJamboreeRoom(opts: TrysteroTransportOptions): TrysteroTransport {
+export function joinJamboreeRoom(
+  opts: TrysteroTransportOptions,
+): TrysteroTransport {
+  const relayUrls = opts.relayUrls;
+  const debug = trysteroDebugEnabled();
+  trysteroInfo('join', {
+    roomId: opts.roomId,
+    selfId,
+    relays: relayUrls ?? '(trystero defaults)',
+  });
+  const callbacks: JoinRoomCallbacks = {
+    onJoinError: (details) => {
+      console.warn('[jam/trystero] join error', details);
+    },
+  };
+  if (debug) {
+    callbacks.onPeerHandshake = async (
+      peerId,
+      _send,
+      _receive,
+      isInitiator,
+    ) => {
+      trysteroInfo('peer handshake', { peerId, isInitiator });
+    };
+  }
   const room = joinRoom(
     {
       appId: opts.appId ?? DEFAULT_APP_ID,
       password: opts.roomKey,
-      relayConfig: opts.relayUrls ? { urls: opts.relayUrls } : undefined,
+      relayConfig: relayUrls ? { urls: relayUrls } : undefined,
       turnConfig: opts.turnConfig,
     },
     opts.roomId,
+    callbacks,
   );
+  if (debug) instrumentRelaySocketsSoon();
   return new TrysteroTransport({ room, localPeerId: selfId });
 }
 
 export class TrysteroTransport implements Transport {
   readonly localPeerId: RemotePeerId;
   private readonly room: Room;
-  private readonly senders: Map<ChannelName, ActionSender<Uint8Array>> = new Map();
+  private readonly senders: Map<
+    ChannelName,
+    ActionSender<Uint8Array>
+  > = new Map();
   private readonly receivers: Map<
     ChannelName,
     Set<(peerId: RemotePeerId, payload: Uint8Array) => void>
@@ -81,19 +113,24 @@ export class TrysteroTransport implements Transport {
         unknown,
       ];
       this.senders.set(channel, send);
-      const handlers = new Set<(p: RemotePeerId, payload: Uint8Array) => void>();
+      const handlers = new Set<
+        (p: RemotePeerId, payload: Uint8Array) => void
+      >();
       this.receivers.set(channel, handlers);
       receive((data, peerId) => {
-        // Trystero hands us the raw payload (Uint8Array on supporting strats).
+        // Trystero hands us the raw payload (Uint8Array on supporting
+        // strategies).
         // Fan out to all subscribed receivers for this channel.
         for (const h of handlers) h(peerId, asUint8Array(data));
       });
     }
 
     this.room.onPeerJoin((peerId) => {
+      trysteroInfo('peer join', { peerId });
       for (const h of this.joinHandlers) h(peerId);
     });
     this.room.onPeerLeave((peerId) => {
+      trysteroInfo('peer leave', { peerId });
       for (const h of this.leaveHandlers) h(peerId);
     });
   }
@@ -108,7 +145,11 @@ export class TrysteroTransport implements Transport {
     return () => this.leaveHandlers.delete(handler);
   }
 
-  send(channel: ChannelName, payload: Uint8Array, peerId?: RemotePeerId): void {
+  send(
+    channel: ChannelName,
+    payload: Uint8Array,
+    peerId?: RemotePeerId,
+  ): void {
     if (this.destroyed) return;
     const sender = this.senders.get(channel);
     if (!sender) return;
@@ -135,6 +176,125 @@ export class TrysteroTransport implements Transport {
   }
 }
 
+function trysteroDebugEnabled(): boolean {
+  try {
+    return localStorage.getItem('jamboree:debug') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function trysteroInfo(event: string, fields?: Record<string, unknown>): void {
+  if (!trysteroDebugEnabled()) return;
+  console.info(`[jam/trystero] ${event}`, fields ?? {});
+}
+
+const instrumentedRelaySockets = new WeakSet<WebSocket>();
+
+function instrumentRelaySocketsSoon(): void {
+  const instrument = (label: string) => {
+    const sockets = getRelaySockets() as Record<string, WebSocket>;
+    const relays = Object.fromEntries(
+      Object.entries(sockets).map(([url, socket]) => [
+        url,
+        readyStateName(socket.readyState),
+      ]),
+    );
+    console.info('[jam/trystero] relay sockets', { label, relays });
+
+    for (const [url, socket] of Object.entries(sockets)) {
+      if (instrumentedRelaySockets.has(socket)) continue;
+      instrumentedRelaySockets.add(socket);
+      socket.addEventListener('open', () => {
+        console.info('[jam/trystero] relay open', { url });
+      });
+      socket.addEventListener('close', (event) => {
+        console.warn('[jam/trystero] relay close', {
+          url,
+          code: event.code,
+          reason: event.reason,
+        });
+      });
+      socket.addEventListener('error', () => {
+        console.warn('[jam/trystero] relay error', { url });
+      });
+      socket.addEventListener('message', (event) => {
+        console.info('[jam/trystero] relay in', {
+          url,
+          message: summarizeRelayMessage(event.data),
+        });
+      });
+      wrapRelaySend(url, socket);
+    }
+  };
+  window.setTimeout(() => instrument('100ms'), 100);
+  window.setTimeout(() => instrument('500ms'), 500);
+  window.setTimeout(() => instrument('2500ms'), 2500);
+}
+
+function wrapRelaySend(url: string, socket: WebSocket): void {
+  const originalSend = socket.send.bind(socket);
+  socket.send = (data: string | ArrayBufferLike | Blob | ArrayBufferView) => {
+    console.info('[jam/trystero] relay out', {
+      url,
+      message: summarizeRelayMessage(data),
+    });
+    originalSend(data);
+  };
+}
+
+function summarizeRelayMessage(data: unknown): unknown {
+  if (typeof data !== 'string') return typeof data;
+  try {
+    const parsed = JSON.parse(data) as Record<string, unknown>;
+    return summarizeTrackerJson(parsed);
+  } catch {
+    return data.length > 160 ? `${data.slice(0, 160)}…` : data;
+  }
+}
+
+function summarizeTrackerJson(msg: Record<string, unknown>): unknown {
+  const offer = msg.offer as { sdp?: string } | undefined;
+  const answer = msg.answer as { sdp?: string } | undefined;
+  return {
+    action: msg.action,
+    info_hash: shortHex(String(msg.info_hash ?? '')),
+    peer_id: msg.peer_id,
+    to_peer_id: msg.to_peer_id,
+    numwant: msg.numwant,
+    interval: msg.interval,
+    offer_id: msg.offer_id,
+    offers: Array.isArray(msg.offers) ? msg.offers.length : undefined,
+    offer: offer ? summarizeSdp(offer.sdp) : undefined,
+    answer: answer ? summarizeSdp(answer.sdp) : undefined,
+    failure: msg['failure reason'],
+    warning: msg['warning message'],
+  };
+}
+
+function summarizeSdp(sdp: unknown): string {
+  return typeof sdp === 'string' ? `${sdp.length} chars` : typeof sdp;
+}
+
+function shortHex(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 12)}…` : value;
+}
+
+function readyStateName(state: number): string {
+  switch (state) {
+    case WebSocket.CONNECTING:
+      return 'connecting';
+    case WebSocket.OPEN:
+      return 'open';
+    case WebSocket.CLOSING:
+      return 'closing';
+    case WebSocket.CLOSED:
+      return 'closed';
+    default:
+      return String(state);
+  }
+}
+
 function asUint8Array(data: unknown): Uint8Array {
   if (data instanceof Uint8Array) return data;
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -142,5 +302,7 @@ function asUint8Array(data: unknown): Uint8Array {
     const view = data as ArrayBufferView;
     return new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
   }
-  throw new Error(`TrysteroTransport: expected binary payload, got ${typeof data}`);
+  throw new Error(
+    `TrysteroTransport: expected binary payload, got ${typeof data}`,
+  );
 }

@@ -18,4 +18,5 @@ npm-debug.log*
 .vscode/*
 !.vscode/extensions.json
 DESIGN.md
+AGENTS.md
 *.lec

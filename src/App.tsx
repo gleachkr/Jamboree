@@ -27,8 +27,8 @@ import { JamboreeRoom } from './core/room.ts';
 import { currentPositionMs } from './core/playback.ts';
 import { JamboreeYProvider } from './core/provider.ts';
 import { MediaCache, type FileStatus } from './core/media.ts';
-import { WSS_TRACKERS } from './core/trackers.ts';
 import { joinJamboreeRoom } from './core/transport-trystero.ts';
+import type { Transport } from './core/transport.ts';
 import { nextWarmupFileRef } from './core/warmup.ts';
 import type {
   ActivityRecord,
@@ -65,11 +65,7 @@ function storeName(value: string): void {
   }
 }
 
-export default function App({
-  swRegistration,
-}: {
-  swRegistration: ServiceWorkerRegistration | null;
-}) {
+export default function App() {
   const [initialInvite] = useState<RoomInvite | null>(readInviteFromBrowser);
   const [generated, setGenerated] = useState<RoomInvite | null>(null);
   const invite = initialInvite ?? generated;
@@ -86,17 +82,11 @@ export default function App({
         <h1>Jamboree</h1>
         <p>An ephemeral, friends-only listening room.</p>
         <button onClick={createRoom}>Create a room</button>
-        {!swRegistration && (
-          <p className="small" style={{ color: 'crimson' }}>
-            Streaming service worker failed to register. Received tracks
-            won&apos;t play.
-          </p>
-        )}
       </main>
     );
   }
 
-  return <Room invite={invite} swRegistration={swRegistration} />;
+  return <Room invite={invite} />;
 }
 
 type RoomState = {
@@ -104,15 +94,10 @@ type RoomState = {
   awareness: Awareness;
   provider: JamboreeYProvider;
   media: MediaCache;
+  transport: Transport;
 };
 
-function Room({
-  invite,
-  swRegistration,
-}: {
-  invite: RoomInvite;
-  swRegistration: ServiceWorkerRegistration | null;
-}) {
+function Room({ invite }: { invite: RoomInvite }) {
   const [state, setState] = useState<RoomState | null>(null);
   const [, force] = useReducer((x: number) => x + 1, 0);
 
@@ -127,18 +112,14 @@ function Room({
     const transport = joinJamboreeRoom({
       roomId: invite.roomId,
       roomKey: invite.key,
-      relayUrls: WSS_TRACKERS,
     });
     const provider = new JamboreeYProvider({
       doc: room.doc,
       awareness,
       transport,
     });
-    const media = new MediaCache({
-      trackers: WSS_TRACKERS,
-      swRegistration,
-    });
-    setState({ room, awareness, provider, media });
+    const media = new MediaCache({ transport });
+    setState({ room, awareness, provider, media, transport });
 
     const unsubDoc = room.subscribe(force);
     const unsubMedia = media.subscribe(force);
@@ -153,12 +134,13 @@ function Room({
       awareness.off('change', onAwareness);
       provider.destroy();
       media.destroy();
+      transport.destroy();
       // provider.destroy already broadcasts our awareness removal; room
       // destroy tears down the doc and chain-destroys the awareness.
       room.destroy();
       setState(null);
     };
-  }, [invite.roomId, invite.key, swRegistration]);
+  }, [invite.roomId, invite.key]);
 
   if (!state) return <main><h1>Jamboree</h1><p className="muted">Connecting…</p></main>;
 
@@ -189,16 +171,16 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
     });
   }
 
-  // Auto-fetch any batch we know about but haven't yet handed to WebTorrent.
+  // Auto-register any batch metadata we know about with the media mesh.
   // This includes both peers' batches (newly arriving via Yjs sync) and our
-  // own after a reload. addBatchFromDoc is idempotent on infoHash; receivers
-  // add with deselect:true so no pieces are requested until a track in the
-  // batch is selected as current or upcoming.
+  // own after a reload. addBatchFromDoc is idempotent on contentId; receivers
+  // don't request bytes until a track in the batch is selected as current or
+  // upcoming.
   useEffect(() => {
     for (const batch of snap.batches.values()) {
       void media.addBatchFromDoc({
-        infoHash: batch.infoHash,
-        torrentFileBase64: batch.torrentFileBase64,
+        contentId: batch.contentId,
+        files: batch.files,
       });
     }
   }, [media, batchIdsFingerprint(snap.batches)]);
@@ -341,17 +323,13 @@ function PlaybackPanel({
   const currentBatch = currentTrack ? snap.batches.get(currentTrack.batchId) : undefined;
   const fileStatus: FileStatus | null =
     currentTrack && currentBatch
-      ? media.getStatus(currentBatch.infoHash, currentTrack.fileIndex)
+      ? media.getStatus(currentBatch.contentId, currentTrack.fileIndex)
       : null;
-  // Both 'streaming' and 'ready' carry a playable URL. Streaming means the
-  // file is partially buffered — the audio element will request ranges via
-  // the service worker and stall if it outruns the chunk store; the buffer
-  // bar below the now-playing block makes that explicit.
-  const playUrl =
-    fileStatus && (fileStatus.kind === 'streaming' || fileStatus.kind === 'ready')
-      ? fileStatus.url
-      : null;
-  const bufferProgress = fileStatus?.kind === 'streaming' ? fileStatus.progress : null;
+  // The mesh protocol creates a playable object URL only after the selected
+  // file is complete. Until then we show download progress and wait.
+  const playUrl = fileStatus?.kind === 'ready' ? fileStatus.url : null;
+  const bufferProgress =
+    fileStatus?.kind === 'downloading' ? fileStatus.progress : null;
 
   // Resolve the next not-ready queue entry/track for serial warmup. Only one
   // non-active file is prefetched at LOW priority at a time; once it is
@@ -359,7 +337,7 @@ function PlaybackPanel({
   const nextRef = nextWarmupFileRef(
     snap,
     derived.queueEntryId,
-    (infoHash, fileIndex) => media.getStatus(infoHash, fileIndex),
+    (contentId, fileIndex) => media.getStatus(contentId, fileIndex),
   );
 
   // Tell the MediaCache which file is currently playing (HIGH priority) and
@@ -367,14 +345,14 @@ function PlaybackPanel({
   useEffect(() => {
     media.setActive(
       currentBatch && currentTrack
-        ? { infoHash: currentBatch.infoHash, fileIndex: currentTrack.fileIndex }
+        ? { contentId: currentBatch.contentId, fileIndex: currentTrack.fileIndex }
         : null,
     );
-  }, [media, currentBatch?.infoHash, currentTrack?.fileIndex]);
+  }, [media, currentBatch?.contentId, currentTrack?.fileIndex]);
 
   useEffect(() => {
     media.setUpcoming(nextRef);
-  }, [media, nextRef?.infoHash, nextRef?.fileIndex]);
+  }, [media, nextRef?.contentId, nextRef?.fileIndex]);
 
   // Slave the audio element to the room's playback intent. We re-anchor on
   // every change to sourceIntentId — that captures play/pause/seek/select
@@ -555,11 +533,11 @@ function describeStatus(s: FileStatus): string {
     case 'unknown':
       return 'Not in cache';
     case 'pending':
-      return `Fetching metadata · ${s.numPeers} ${peerWord(s.numPeers)}`;
-    case 'streaming':
+      return `Waiting · ${s.numPeers} ${peerWord(s.numPeers)}`;
+    case 'downloading':
       // % is shown via the animated <BufferBar/>; the badge stays text-only
-      // so it doesn't jump on every piece (~2-4% each for small files).
-      return `Buffering · ${s.numPeers} ${peerWord(s.numPeers)}`;
+      // so it doesn't jump on every chunk.
+      return `Downloading · ${s.numPeers} ${peerWord(s.numPeers)}`;
     case 'ready':
       return `Ready · ${s.numPeers} ${peerWord(s.numPeers)}`;
   }
@@ -569,7 +547,7 @@ function statusBadgeClass(s: FileStatus): string {
   switch (s.kind) {
     case 'ready':
       return 'badge ok';
-    case 'streaming':
+    case 'downloading':
     case 'pending':
       return 'badge busy';
     case 'unknown':
@@ -660,7 +638,7 @@ function QueuePanel({
                 const isCurrent = entry.entryId === derived.queueEntryId;
                 const status =
                   batch && meta
-                    ? media.getStatus(batch.infoHash, meta.fileIndex)
+                    ? media.getStatus(batch.contentId, meta.fileIndex)
                     : null;
                 return (
                   <SortableQueueRow
@@ -750,7 +728,7 @@ function SortableQueueRow({
             </>
           )}
         </div>
-        {status?.kind === 'streaming' && (
+        {status?.kind === 'downloading' && (
           <BufferBar progress={status.progress} />
         )}
       </button>
@@ -773,8 +751,7 @@ function IngestPanel({ room, media }: { room: JamboreeRoom; media: MediaCache })
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Whole-drop ingestion: every file the user drops in a single gesture
-  // becomes one multi-file torrent (one Batch in the doc). Receivers add
-  // the batch with deselect:true and only fetch pieces for whichever
+  // becomes one Batch in the doc. Receivers only request chunks for whichever
   // file is selected as current/upcoming.
   async function ingestFiles(rawFiles: File[]) {
     const files = rawFiles.filter(isAudioFile);
@@ -798,8 +775,7 @@ function IngestPanel({ room, media }: { room: JamboreeRoom; media: MediaCache })
       }));
       room.addAndEnqueueBatch(
         {
-          infoHash: seeded.infoHash,
-          torrentFileBase64: seeded.torrentFileBase64,
+          contentId: seeded.contentId,
           files: seeded.files,
         },
         trackInputs,
