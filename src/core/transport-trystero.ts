@@ -44,20 +44,41 @@ export type TrysteroTransportOptions = {
     username?: string;
     credential?: string;
   }>;
+  // Trystero's torrent strategy can keep stale per-room offer state after a
+  // WebRTC disconnect. A full leave/join clears that state, matching the
+  // manual page refresh that users report as fixing repeering.
+  zeroPeerRejoinDelayMs?: number;
+  rejoinCooldownMs?: number;
 };
 
 const DEFAULT_APP_ID = 'jamboree.app';
+const DEFAULT_ZERO_PEER_REJOIN_DELAY_MS = 5_000;
+const DEFAULT_REJOIN_COOLDOWN_MS = 30_000;
 
 export function joinJamboreeRoom(
   opts: TrysteroTransportOptions,
 ): TrysteroTransport {
-  const relayUrls = opts.relayUrls;
   const debug = trysteroDebugEnabled();
   trysteroInfo('join', {
     roomId: opts.roomId,
     selfId,
-    relays: relayUrls ?? '(trystero defaults)',
+    relays: opts.relayUrls ?? '(trystero defaults)',
   });
+  const room = createTrysteroRoom(opts, debug);
+  if (debug) instrumentRelaySocketsSoon();
+  return new TrysteroTransport({
+    opts,
+    room,
+    localPeerId: selfId,
+    debug,
+  });
+}
+
+function createTrysteroRoom(
+  opts: TrysteroTransportOptions,
+  debug: boolean,
+): Room {
+  const relayUrls = opts.relayUrls;
   const callbacks: JoinRoomCallbacks = {
     onJoinError: (details) => {
       console.warn('[jam/trystero] join error', details);
@@ -73,7 +94,7 @@ export function joinJamboreeRoom(
       trysteroInfo('peer handshake', { peerId, isInitiator });
     };
   }
-  const room = joinRoom(
+  return joinRoom(
     {
       appId: opts.appId ?? DEFAULT_APP_ID,
       password: opts.roomKey,
@@ -83,13 +104,14 @@ export function joinJamboreeRoom(
     opts.roomId,
     callbacks,
   );
-  if (debug) instrumentRelaySocketsSoon();
-  return new TrysteroTransport({ room, localPeerId: selfId });
 }
 
 export class TrysteroTransport implements Transport {
   readonly localPeerId: RemotePeerId;
-  private readonly room: Room;
+
+  private readonly opts: TrysteroTransportOptions;
+  private readonly debug: boolean;
+  private room: Room;
   private readonly senders: Map<
     ChannelName,
     ActionSender<Uint8Array>
@@ -100,39 +122,29 @@ export class TrysteroTransport implements Transport {
   > = new Map();
   private readonly joinHandlers = new Set<(peerId: RemotePeerId) => void>();
   private readonly leaveHandlers = new Set<(peerId: RemotePeerId) => void>();
+  private readonly currentPeerIds = new Set<RemotePeerId>();
   private destroyed = false;
+  private hasEverHadPeer = false;
+  private rejoinTimer: ReturnType<typeof setTimeout> | null = null;
+  private rejoinInFlight: Promise<void> | null = null;
+  private lastRejoinAtMs = 0;
 
-  constructor(opts: { room: Room; localPeerId: RemotePeerId }) {
+  constructor(opts: {
+    opts: TrysteroTransportOptions;
+    room: Room;
+    localPeerId: RemotePeerId;
+    debug: boolean;
+  }) {
+    this.opts = opts.opts;
     this.room = opts.room;
     this.localPeerId = opts.localPeerId;
+    this.debug = opts.debug;
 
     for (const channel of CHANNELS) {
-      const [send, receive] = this.room.makeAction<Uint8Array>(channel) as [
-        ActionSender<Uint8Array>,
-        ActionReceiver<Uint8Array>,
-        unknown,
-      ];
-      this.senders.set(channel, send);
-      const handlers = new Set<
-        (p: RemotePeerId, payload: Uint8Array) => void
-      >();
-      this.receivers.set(channel, handlers);
-      receive((data, peerId) => {
-        // Trystero hands us the raw payload (Uint8Array on supporting
-        // strategies).
-        // Fan out to all subscribed receivers for this channel.
-        for (const h of handlers) h(peerId, asUint8Array(data));
-      });
+      this.receivers.set(channel, new Set());
     }
-
-    this.room.onPeerJoin((peerId) => {
-      trysteroInfo('peer join', { peerId });
-      for (const h of this.joinHandlers) h(peerId);
-    });
-    this.room.onPeerLeave((peerId) => {
-      trysteroInfo('peer leave', { peerId });
-      for (const h of this.leaveHandlers) h(peerId);
-    });
+    this.attachRoom(opts.room);
+    this.addBrowserOnlineHandler();
   }
 
   onPeerJoin(handler: (peerId: RemotePeerId) => void): () => void {
@@ -172,8 +184,113 @@ export class TrysteroTransport implements Transport {
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.clearRejoinTimer();
+    this.removeBrowserOnlineHandler();
+    this.currentPeerIds.clear();
     void this.room.leave();
   }
+
+  private attachRoom(room: Room): void {
+    this.room = room;
+    this.senders.clear();
+
+    for (const channel of CHANNELS) {
+      const [send, receive] = room.makeAction<Uint8Array>(channel) as [
+        ActionSender<Uint8Array>,
+        ActionReceiver<Uint8Array>,
+        unknown,
+      ];
+      this.senders.set(channel, send);
+      const handlers = this.receivers.get(channel);
+      if (!handlers) throw new Error(`unknown channel ${channel}`);
+      receive((data, peerId) => {
+        if (this.destroyed || room !== this.room) return;
+        for (const h of handlers) h(peerId, asUint8Array(data));
+      });
+    }
+
+    room.onPeerJoin((peerId) => {
+      if (this.destroyed || room !== this.room) return;
+      trysteroInfo('peer join', { peerId });
+      this.hasEverHadPeer = true;
+      this.currentPeerIds.add(peerId);
+      this.clearRejoinTimer();
+      for (const h of this.joinHandlers) h(peerId);
+    });
+    room.onPeerLeave((peerId) => {
+      if (this.destroyed || room !== this.room) return;
+      trysteroInfo('peer leave', { peerId });
+      this.currentPeerIds.delete(peerId);
+      for (const h of this.leaveHandlers) h(peerId);
+      this.scheduleZeroPeerRejoin('all peers left');
+    });
+  }
+
+  private scheduleZeroPeerRejoin(reason: string): void {
+    if (this.destroyed) return;
+    if (!this.hasEverHadPeer || this.currentPeerIds.size > 0) return;
+    if (this.rejoinTimer || this.rejoinInFlight) return;
+
+    const now = Date.now();
+    const delay = this.opts.zeroPeerRejoinDelayMs
+      ?? DEFAULT_ZERO_PEER_REJOIN_DELAY_MS;
+    const cooldown = this.opts.rejoinCooldownMs ?? DEFAULT_REJOIN_COOLDOWN_MS;
+    const sinceLastRejoin = now - this.lastRejoinAtMs;
+    const cooldownRemaining = Math.max(0, cooldown - sinceLastRejoin);
+    const ms = Math.max(delay, cooldownRemaining);
+    trysteroInfo('schedule rejoin', { reason, ms });
+    this.rejoinTimer = setTimeout(() => {
+      this.rejoinTimer = null;
+      void this.rejoinAfterZeroPeers(reason);
+    }, ms);
+  }
+
+  private async rejoinAfterZeroPeers(reason: string): Promise<void> {
+    if (this.destroyed || this.currentPeerIds.size > 0) return;
+    if (this.rejoinInFlight) return this.rejoinInFlight;
+
+    this.rejoinInFlight = (async () => {
+      const oldRoom = this.room;
+      this.lastRejoinAtMs = Date.now();
+      this.senders.clear();
+      trysteroInfo('rejoin', { reason });
+      try {
+        await oldRoom.leave();
+      } catch (err) {
+        console.warn('[jam/trystero] rejoin leave failed', err);
+      }
+      if (this.destroyed || this.currentPeerIds.size > 0) return;
+      this.attachRoom(createTrysteroRoom(this.opts, this.debug));
+      if (this.debug) instrumentRelaySocketsSoon();
+    })().finally(() => {
+      this.rejoinInFlight = null;
+    });
+
+    await this.rejoinInFlight;
+  }
+
+  private clearRejoinTimer(): void {
+    if (!this.rejoinTimer) return;
+    clearTimeout(this.rejoinTimer);
+    this.rejoinTimer = null;
+  }
+
+  private addBrowserOnlineHandler(): void {
+    if (typeof window === 'undefined') return;
+    window.addEventListener('online', this.handleBrowserOnline);
+  }
+
+  private removeBrowserOnlineHandler(): void {
+    if (typeof window === 'undefined') return;
+    window.removeEventListener('online', this.handleBrowserOnline);
+  }
+
+  private handleBrowserOnline = (): void => {
+    if (this.destroyed) return;
+    if (!this.hasEverHadPeer || this.currentPeerIds.size > 0) return;
+    this.clearRejoinTimer();
+    void this.rejoinAfterZeroPeers('browser online');
+  };
 }
 
 function trysteroDebugEnabled(): boolean {
