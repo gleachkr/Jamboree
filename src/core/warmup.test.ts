@@ -84,16 +84,34 @@ describe('nextWarmupFileRef', () => {
     });
   });
 
-  it('returns null once every upcoming entry is ready', () => {
+  it('wraps to the beginning after reaching the end', () => {
     const snap = snapshot(['a', 'b', 'c']);
 
-    expect(nextWarmupFileRef(snap, 'a', statusMap(['b', 'c']))).toBeNull();
+    expect(nextWarmupFileRef(snap, 'b', statusMap(['c']))).toEqual({
+      contentId: 'a'.padEnd(40, 'a'),
+      fileIndex: 0,
+    });
   });
 
-  it('does not warm entries before the current one', () => {
+  it('starts at the beginning when the current entry is last', () => {
     const snap = snapshot(['a', 'b', 'c']);
 
-    expect(nextWarmupFileRef(snap, 'b', statusMap(['c']))).toBeNull();
+    expect(nextWarmupFileRef(snap, 'c', statusMap([]))).toEqual({
+      contentId: 'a'.padEnd(40, 'a'),
+      fileIndex: 0,
+    });
+  });
+
+  it('returns null once every non-active entry is ready', () => {
+    const snap = snapshot(['a', 'b', 'c']);
+
+    expect(nextWarmupFileRef(snap, 'b', statusMap(['a', 'c']))).toBeNull();
+  });
+
+  it('does not warm the current entry', () => {
+    const snap = snapshot(['a']);
+
+    expect(nextWarmupFileRef(snap, 'a', statusMap([]))).toBeNull();
   });
 
   it('returns null if the current entry has left the queue', () => {

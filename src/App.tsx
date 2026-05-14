@@ -333,7 +333,7 @@ function PlaybackPanel({
 
   // Resolve the next not-ready queue entry/track for serial warmup. Only one
   // non-active file is prefetched at LOW priority at a time; once it is
-  // ready, the scan skips it and moves farther down the upcoming queue.
+  // ready, the scan skips it and keeps moving around the queue.
   const nextRef = nextWarmupFileRef(
     snap,
     derived.queueEntryId,

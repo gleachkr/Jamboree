@@ -15,12 +15,12 @@ type WarmupSnapshot = {
 type WarmupStatus = Pick<FileStatus, 'kind'>;
 
 // Return the next not-yet-ready queue file to warm, scanning forward from the
-// current queue entry. When nothing is selected yet, queue[0] is the likely
-// first play, so the scan starts there.
+// current queue entry and wrapping around at the end. When nothing is selected
+// yet, queue[0] is the likely first play, so the scan starts there.
 //
 // This intentionally warms only one non-active file at a time. Once that file
 // reaches ready, the next render skips over it and selects the following
-// not-ready file. That gives us serial warmup down the upcoming queue without
+// not-ready file. That gives us serial warmup around the queue without
 // spreading requests across many files at once.
 export function nextWarmupFileRef(
   snap: WarmupSnapshot,
@@ -38,8 +38,9 @@ export function nextWarmupFileRef(
     startIdx = currentIdx + 1;
   }
 
-  for (let i = startIdx; i < snap.queue.length; i += 1) {
-    const entry = snap.queue[i]!;
+  const scanCount = currentEntryId ? snap.queue.length - 1 : snap.queue.length;
+  for (let offset = 0; offset < scanCount; offset += 1) {
+    const entry = snap.queue[(startIdx + offset) % snap.queue.length]!;
     const meta = snap.tracks.get(entry.trackId);
     if (!meta) continue;
     const batch = snap.batches.get(meta.batchId);
