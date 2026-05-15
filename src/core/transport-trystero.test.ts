@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChannelName } from './transport.ts';
 
 type ReceiveHandler = (data: Uint8Array, peerId: string) => void;
@@ -81,6 +81,11 @@ beforeEach(() => {
   mockTrystero.joinRoom.mockClear();
 });
 
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
+});
+
 describe('TrysteroTransport', () => {
   it('rejoins the Trystero room after all known peers leave', async () => {
     const transport = joinJamboreeRoom({
@@ -124,4 +129,119 @@ describe('TrysteroTransport', () => {
 
     transport.destroy();
   });
+
+  it('keeps retrying while previously connected and peerless', async () => {
+    const transport = joinJamboreeRoom({
+      roomId: 'room',
+      roomKey: 'key',
+      zeroPeerRejoinDelayMs: 100,
+      rejoinCooldownMs: 0,
+    });
+    const firstRoom = mockTrystero.rooms[0]!;
+
+    firstRoom.emitJoin('peer_a');
+    firstRoom.emitLeave('peer_a');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(mockTrystero.rooms).toHaveLength(2);
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(mockTrystero.rooms).toHaveLength(3);
+
+    transport.destroy();
+  });
+
+  it('accelerates a pending rejoin when the page becomes visible', async () => {
+    const browser = installBrowserLifecycle();
+    const transport = joinJamboreeRoom({
+      roomId: 'room',
+      roomKey: 'key',
+      zeroPeerRejoinDelayMs: 10_000,
+      rejoinCooldownMs: 0,
+    });
+    const firstRoom = mockTrystero.rooms[0]!;
+
+    firstRoom.emitJoin('peer_a');
+    firstRoom.emitLeave('peer_a');
+    browser.fireDocument('visibilitychange');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockTrystero.rooms).toHaveLength(2);
+
+    transport.destroy();
+  });
+
+  it('accelerates a pending rejoin on page show', async () => {
+    const browser = installBrowserLifecycle();
+    const transport = joinJamboreeRoom({
+      roomId: 'room',
+      roomKey: 'key',
+      zeroPeerRejoinDelayMs: 10_000,
+      rejoinCooldownMs: 0,
+    });
+    const firstRoom = mockTrystero.rooms[0]!;
+
+    firstRoom.emitJoin('peer_a');
+    firstRoom.emitLeave('peer_a');
+    browser.fireWindow('pageshow');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockTrystero.rooms).toHaveLength(2);
+
+    transport.destroy();
+  });
 });
+
+type Listener = () => void;
+
+function installBrowserLifecycle(): {
+  fireDocument: (type: string) => void;
+  fireWindow: (type: string) => void;
+} {
+  const documentListeners = new Map<string, Set<Listener>>();
+  const windowListeners = new Map<string, Set<Listener>>();
+  const add = (
+    listeners: Map<string, Set<Listener>>,
+    type: string,
+    listener: Listener,
+  ) => {
+    let set = listeners.get(type);
+    if (!set) {
+      set = new Set();
+      listeners.set(type, set);
+    }
+    set.add(listener);
+  };
+  const remove = (
+    listeners: Map<string, Set<Listener>>,
+    type: string,
+    listener: Listener,
+  ) => {
+    listeners.get(type)?.delete(listener);
+  };
+  const fire = (listeners: Map<string, Set<Listener>>, type: string) => {
+    for (const listener of listeners.get(type) ?? []) listener();
+  };
+
+  vi.stubGlobal('document', {
+    visibilityState: 'visible',
+    addEventListener: vi.fn((type: string, listener: Listener) => {
+      add(documentListeners, type, listener);
+    }),
+    removeEventListener: vi.fn((type: string, listener: Listener) => {
+      remove(documentListeners, type, listener);
+    }),
+  });
+  vi.stubGlobal('window', {
+    addEventListener: vi.fn((type: string, listener: Listener) => {
+      add(windowListeners, type, listener);
+    }),
+    removeEventListener: vi.fn((type: string, listener: Listener) => {
+      remove(windowListeners, type, listener);
+    }),
+  });
+
+  return {
+    fireDocument: (type: string) => fire(documentListeners, type),
+    fireWindow: (type: string) => fire(windowListeners, type),
+  };
+}

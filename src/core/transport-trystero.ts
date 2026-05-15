@@ -126,6 +126,7 @@ export class TrysteroTransport implements Transport {
   private destroyed = false;
   private hasEverHadPeer = false;
   private rejoinTimer: ReturnType<typeof setTimeout> | null = null;
+  private rejoinTimerTargetMs = 0;
   private rejoinInFlight: Promise<void> | null = null;
   private lastRejoinAtMs = 0;
 
@@ -144,7 +145,7 @@ export class TrysteroTransport implements Transport {
       this.receivers.set(channel, new Set());
     }
     this.attachRoom(opts.room);
-    this.addBrowserOnlineHandler();
+    this.addBrowserLifecycleHandlers();
   }
 
   onPeerJoin(handler: (peerId: RemotePeerId) => void): () => void {
@@ -185,7 +186,7 @@ export class TrysteroTransport implements Transport {
     if (this.destroyed) return;
     this.destroyed = true;
     this.clearRejoinTimer();
-    this.removeBrowserOnlineHandler();
+    this.removeBrowserLifecycleHandlers();
     this.currentPeerIds.clear();
     void this.room.leave();
   }
@@ -226,21 +227,31 @@ export class TrysteroTransport implements Transport {
     });
   }
 
-  private scheduleZeroPeerRejoin(reason: string): void {
+  private scheduleZeroPeerRejoin(
+    reason: string,
+    minDelayMs = this.opts.zeroPeerRejoinDelayMs
+      ?? DEFAULT_ZERO_PEER_REJOIN_DELAY_MS,
+  ): void {
     if (this.destroyed) return;
     if (!this.hasEverHadPeer || this.currentPeerIds.size > 0) return;
-    if (this.rejoinTimer || this.rejoinInFlight) return;
+    if (this.rejoinInFlight) return;
 
     const now = Date.now();
-    const delay = this.opts.zeroPeerRejoinDelayMs
-      ?? DEFAULT_ZERO_PEER_REJOIN_DELAY_MS;
     const cooldown = this.opts.rejoinCooldownMs ?? DEFAULT_REJOIN_COOLDOWN_MS;
     const sinceLastRejoin = now - this.lastRejoinAtMs;
     const cooldownRemaining = Math.max(0, cooldown - sinceLastRejoin);
-    const ms = Math.max(delay, cooldownRemaining);
+    const ms = Math.max(minDelayMs, cooldownRemaining);
+    const targetMs = now + ms;
+    if (this.rejoinTimer) {
+      if (this.rejoinTimerTargetMs <= targetMs) return;
+      this.clearRejoinTimer();
+    }
+
     trysteroInfo('schedule rejoin', { reason, ms });
+    this.rejoinTimerTargetMs = targetMs;
     this.rejoinTimer = setTimeout(() => {
       this.rejoinTimer = null;
+      this.rejoinTimerTargetMs = 0;
       void this.rejoinAfterZeroPeers(reason);
     }, ms);
   }
@@ -264,6 +275,7 @@ export class TrysteroTransport implements Transport {
       if (this.debug) instrumentRelaySocketsSoon();
     })().finally(() => {
       this.rejoinInFlight = null;
+      this.scheduleZeroPeerRejoin('still no peers after rejoin');
     });
 
     await this.rejoinInFlight;
@@ -273,23 +285,49 @@ export class TrysteroTransport implements Transport {
     if (!this.rejoinTimer) return;
     clearTimeout(this.rejoinTimer);
     this.rejoinTimer = null;
+    this.rejoinTimerTargetMs = 0;
   }
 
-  private addBrowserOnlineHandler(): void {
+  private addBrowserLifecycleHandlers(): void {
     if (typeof window === 'undefined') return;
     window.addEventListener('online', this.handleBrowserOnline);
+    window.addEventListener('pageshow', this.handlePageShow);
+    if (typeof document !== 'undefined') {
+      document.addEventListener(
+        'visibilitychange',
+        this.handleVisibilityChange,
+      );
+    }
   }
 
-  private removeBrowserOnlineHandler(): void {
+  private removeBrowserLifecycleHandlers(): void {
     if (typeof window === 'undefined') return;
     window.removeEventListener('online', this.handleBrowserOnline);
+    window.removeEventListener('pageshow', this.handlePageShow);
+    if (typeof document !== 'undefined') {
+      document.removeEventListener(
+        'visibilitychange',
+        this.handleVisibilityChange,
+      );
+    }
   }
 
   private handleBrowserOnline = (): void => {
-    if (this.destroyed) return;
-    if (!this.hasEverHadPeer || this.currentPeerIds.size > 0) return;
-    this.clearRejoinTimer();
-    void this.rejoinAfterZeroPeers('browser online');
+    this.scheduleZeroPeerRejoin('browser online', 0);
+  };
+
+  private handlePageShow = (): void => {
+    this.scheduleZeroPeerRejoin('page show', 0);
+  };
+
+  private handleVisibilityChange = (): void => {
+    if (
+      typeof document !== 'undefined'
+      && document.visibilityState !== 'visible'
+    ) {
+      return;
+    }
+    this.scheduleZeroPeerRejoin('page visible', 0);
   };
 }
 
