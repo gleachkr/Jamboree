@@ -13,3 +13,15 @@ const root = createRoot(rootEl);
 // that rapid join → leave → join cycle. It can make discovery look broken even
 // though the room code is otherwise fine.
 root.render(<App />);
+
+// Register the PWA service worker after first paint, production only — Vite
+// dev's HMR fetches don't mix well with a cache-first SW. The SW scope is
+// implicitly the directory it lives in (e.g. /Jamboree/), so deep links to
+// /Jamboree/r/<id> are still covered.
+if ('serviceWorker' in navigator && import.meta.env.PROD) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker
+      .register(`${import.meta.env.BASE_URL}sw.js`)
+      .catch((err) => console.warn('[jam/sw] registration failed', err));
+  });
+}

@@ -56,6 +56,20 @@ h1 {
   border-color: color-mix(in srgb, goldenrod 50%, transparent);
 }
 
+.conn-pill--offline {
+  color: crimson;
+  border-color: color-mix(in srgb, crimson 50%, transparent);
+}
+
+.offline-banner {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  background: color-mix(in srgb, crimson 12%, transparent);
+  border: 1px solid color-mix(in srgb, crimson 35%, transparent);
+  color: color-mix(in srgb, crimson 90%, currentColor);
+}
+
 .conn-dot {
   width: 0.5rem;
   height: 0.5rem;

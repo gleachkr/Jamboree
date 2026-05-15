@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Jamboree">
+  <rect width="512" height="512" fill="#1a1a1a"/>
+  <g transform="translate(256 256)">
+    <circle r="150" fill="#222" stroke="#3cb371" stroke-width="5"/>
+    <circle r="118" fill="none" stroke="#2d6f55" stroke-width="2"/>
+    <circle r="90"  fill="none" stroke="#2d6f55" stroke-width="2"/>
+    <circle r="60"  fill="none" stroke="#2d6f55" stroke-width="2"/>
+    <circle r="32"  fill="#3cb371"/>
+    <circle r="8"   fill="#1a1a1a"/>
+  </g>
+</svg>

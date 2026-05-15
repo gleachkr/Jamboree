@@ -30,6 +30,7 @@ import { MediaCache, type FileStatus } from './core/media.ts';
 import { joinJamboreeRoom } from './core/transport-trystero.ts';
 import type { Transport } from './core/transport.ts';
 import { nextWarmupFileRef } from './core/warmup.ts';
+import { getPref, rememberRoom, setPref } from './core/persistence.ts';
 import type {
   ActivityRecord,
   Batch,
@@ -39,7 +40,10 @@ import type {
   TrackMeta,
 } from './core/types.ts';
 
+// localStorage stores a synchronous mirror of the display name so first paint
+// doesn't flash an empty input. IndexedDB is the durable home (DESIGN.md §10).
 const NAME_STORAGE_KEY = 'jamboree:name';
+const NAME_PREF_KEY = 'displayName';
 
 function readInviteFromBrowser(): RoomInvite | null {
   return parseInviteFromParts(window.location.pathname, window.location.hash);
@@ -49,7 +53,7 @@ function appBaseUrl(): string {
   return new URL(import.meta.env.BASE_URL, window.location.origin).toString();
 }
 
-function loadStoredName(): string {
+function loadCachedName(): string {
   try {
     return localStorage.getItem(NAME_STORAGE_KEY) ?? '';
   } catch {
@@ -57,12 +61,30 @@ function loadStoredName(): string {
   }
 }
 
-function storeName(value: string): void {
+function persistName(value: string): void {
   try {
     localStorage.setItem(NAME_STORAGE_KEY, value);
   } catch {
     // ignore quota / private mode failures
   }
+  void setPref(NAME_PREF_KEY, value);
+}
+
+function useOnline(): boolean {
+  const [online, setOnline] = useState(() =>
+    typeof navigator === 'undefined' ? true : navigator.onLine,
+  );
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener('online', on);
+    window.addEventListener('offline', off);
+    return () => {
+      window.removeEventListener('online', on);
+      window.removeEventListener('offline', off);
+    };
+  }, []);
+  return online;
 }
 
 export default function App() {
@@ -106,9 +128,24 @@ function Room({ invite }: { invite: RoomInvite }) {
     const awareness = new Awareness(room.doc);
     awareness.setLocalState({
       peerId: room.peerId,
-      name: loadStoredName(),
+      name: loadCachedName(),
       clientKind: 'browser',
     });
+    // Hydrate the durable name from IDB and bump the recent-rooms list. Both
+    // are best-effort: failures (Node test env, private mode, etc.) are
+    // silently swallowed in persistence.ts.
+    void (async () => {
+      const stored = await getPref<string>(NAME_PREF_KEY);
+      if (typeof stored === 'string' && stored.length > 0) {
+        awareness.setLocalStateField('name', stored);
+        try {
+          localStorage.setItem(NAME_STORAGE_KEY, stored);
+        } catch {
+          // ignore
+        }
+      }
+      void rememberRoom(invite.roomId);
+    })();
     const transport = joinJamboreeRoom({
       roomId: invite.roomId,
       roomKey: invite.key,
@@ -155,6 +192,7 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
   const peerStates = Array.from(awareness.getStates().entries());
   const remotePeerCount = provider.getRemotePeers().size;
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const online = useOnline();
 
   // Browsers tie media autoplay to a user-activation token that only lives
   // synchronously inside the gesture handler. Most of our user actions go
@@ -189,11 +227,17 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
     <main>
       <header className="room-header">
         <h1>Jamboree</h1>
-        <ConnectionPill remotePeerCount={remotePeerCount} />
+        <ConnectionPill remotePeerCount={remotePeerCount} online={online} />
       </header>
       <p>
         Room: <strong>{invite.roomId}</strong>
       </p>
+      {!online && (
+        <p className="offline-banner small">
+          You're offline. Jamboree rooms need active network peers — reconnect
+          to join others.
+        </p>
+      )}
       <details>
         <summary>Share link</summary>
         <code>{inviteUrl}</code>
@@ -224,7 +268,21 @@ function batchIdsFingerprint(batches: ReadonlyMap<string, Batch>): string {
   return ids.join('|');
 }
 
-function ConnectionPill({ remotePeerCount }: { remotePeerCount: number }) {
+function ConnectionPill({
+  remotePeerCount,
+  online,
+}: {
+  remotePeerCount: number;
+  online: boolean;
+}) {
+  if (!online) {
+    return (
+      <span className="conn-pill conn-pill--offline">
+        <span className="conn-dot" />
+        Offline
+      </span>
+    );
+  }
   if (remotePeerCount === 0) {
     return (
       <span className="conn-pill conn-pill--searching">
@@ -254,7 +312,7 @@ function PeersPanel({
 
   function commitName(value: string) {
     setName(value);
-    storeName(value);
+    persistName(value);
     awareness.setLocalStateField('name', value);
   }
 
@@ -406,6 +464,110 @@ function PlaybackPanel({
     derived.queueEntryId,
     derived.trackId,
   ]);
+
+  // Media Session API: surface metadata + transport controls to the OS so
+  // headset buttons, lock-screen widgets, and system tray controls all drive
+  // the same room intent log as the in-page buttons. Per DESIGN.md §10 we
+  // only register where supported and route every action through the room
+  // command layer — no special-cased authority.
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    if (currentTrack) {
+      try {
+        ms.metadata = new MediaMetadata({
+          title: currentTrack.title || 'Jamboree',
+          artist: currentTrack.artist ?? '',
+          album: currentTrack.album ?? '',
+        });
+      } catch {
+        // Some embedded WebViews construct MediaMetadata lazily.
+      }
+    } else {
+      ms.metadata = null;
+    }
+    ms.playbackState =
+      derived.status === 'playing'
+        ? 'playing'
+        : derived.status === 'paused'
+          ? 'paused'
+          : 'none';
+  }, [
+    currentTrack?.id,
+    currentTrack?.title,
+    currentTrack?.artist,
+    currentTrack?.album,
+    derived.status,
+  ]);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    const audio = audioRef.current;
+    if (typeof ms.setPositionState !== 'function') return;
+    if (!audio || derived.status === 'stopped' || !currentTrack) {
+      try { ms.setPositionState({}); } catch { /* ignore */ }
+      return;
+    }
+    const duration = (currentTrack.durationMs ?? 0) / 1000;
+    try {
+      ms.setPositionState({
+        duration: duration > 0 ? duration : 0,
+        position: Math.max(0, audio.currentTime),
+        playbackRate: audio.playbackRate || 1,
+      });
+    } catch {
+      // Spec rejects negative/NaN values; treat as best-effort.
+    }
+  }, [
+    derived.status,
+    derived.queueEntryId,
+    derived.sourceIntentId,
+    currentTrack?.id,
+    currentTrack?.durationMs,
+  ]);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    type Entry = [MediaSessionAction, MediaSessionActionHandler];
+    const audio = audioRef.current;
+    const handlers: Entry[] = [
+      ['play', () => room.play()],
+      ['pause', () => room.pause()],
+      ['nexttrack', () => room.skipNext()],
+      ['previoustrack', () => room.skipPrevious()],
+      ['stop', () => room.stop()],
+      ['seekto', (details) => {
+        if (typeof details.seekTime !== 'number') return;
+        room.seek(details.seekTime * 1000);
+      }],
+      ['seekbackward', (details) => {
+        const delta = (details.seekOffset ?? 10) * 1000;
+        const current = audio ? audio.currentTime * 1000 : 0;
+        room.seek(Math.max(0, current - delta));
+      }],
+      ['seekforward', (details) => {
+        const delta = (details.seekOffset ?? 30) * 1000;
+        const current = audio ? audio.currentTime * 1000 : 0;
+        room.seek(current + delta);
+      }],
+    ];
+    const registered: MediaSessionAction[] = [];
+    for (const [action, handler] of handlers) {
+      try {
+        ms.setActionHandler(action, handler);
+        registered.push(action);
+      } catch {
+        // Browser does not support this action — skip cleanly.
+      }
+    }
+    return () => {
+      for (const action of registered) {
+        try { ms.setActionHandler(action, null); } catch { /* ignore */ }
+      }
+    };
+  }, [room, audioRef]);
 
   function manuallyResume() {
     const audio = audioRef.current;
