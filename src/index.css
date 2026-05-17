@@ -141,7 +141,7 @@ code {
   letter-spacing: 0;
 }
 
-.copy-link {
+.share-link {
   min-width: 6.5rem;
   padding: 0.4rem 0.55rem;
   color: var(--muted);
@@ -149,7 +149,7 @@ code {
   text-align: center;
 }
 
-.copy-link:hover:not(:disabled) {
+.share-link:hover:not(:disabled) {
   color: var(--text);
 }
 
@@ -539,7 +539,7 @@ button.compact {
     display: inline;
   }
 
-  .copy-link {
+  .share-link {
     min-width: 0;
     padding-inline: 0.4rem;
     font-size: 0.8rem;

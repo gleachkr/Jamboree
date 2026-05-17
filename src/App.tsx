@@ -70,6 +70,9 @@ function persistName(value: string): void {
   void setPref(NAME_PREF_KEY, value);
 }
 
+type ShareInviteResult = 'shared' | 'copied' | 'cancelled' | 'failed';
+type ShareInviteState = Exclude<ShareInviteResult, 'cancelled'> | 'idle';
+
 async function copyText(value: string): Promise<boolean> {
   try {
     if (navigator.clipboard) {
@@ -93,6 +96,36 @@ async function copyText(value: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function isShareCancellation(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'name' in error &&
+    error.name === 'AbortError'
+  );
+}
+
+async function shareInviteUrl(url: string): Promise<ShareInviteResult> {
+  const shareData: ShareData = {
+    title: 'Jamboree room',
+    text: 'Join my Jamboree room.',
+    url,
+  };
+
+  if (navigator.share && navigator.canShare?.(shareData) !== false) {
+    try {
+      await navigator.share(shareData);
+      return 'shared';
+    } catch (error) {
+      if (isShareCancellation(error)) return 'cancelled';
+      // If the native share sheet is unavailable or rejects the payload,
+      // retain the older clipboard behavior as a fallback.
+    }
+  }
+
+  return (await copyText(url)) ? 'copied' : 'failed';
 }
 
 function useOnline(): boolean {
@@ -223,14 +256,14 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
   const [activeTab, setActiveTab] = useState<AppTab>('player');
   const upload = useTrackIngest(room, media);
   const viewportDragOver = useViewportFileDrop(upload.ingestFiles);
-  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>(
-    'idle',
-  );
+  const [shareState, setShareState] = useState<ShareInviteState>('idle');
 
-  async function copyInvite() {
-    const ok = await copyText(inviteUrl);
-    setCopyState(ok ? 'copied' : 'failed');
-    window.setTimeout(() => setCopyState('idle'), 1600);
+  async function shareInvite() {
+    setShareState('idle');
+    const result = await shareInviteUrl(inviteUrl);
+    if (result === 'cancelled') return;
+    setShareState(result);
+    window.setTimeout(() => setShareState('idle'), 1600);
   }
 
   // Browsers tie media autoplay to a user-activation token that only lives
@@ -295,15 +328,17 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
         />
         <button
           type="button"
-          className="copy-link"
-          onClick={copyInvite}
-          aria-label="Copy room link"
+          className="share-link"
+          onClick={shareInvite}
+          aria-label="Share room link"
         >
-          {copyState === 'copied'
-            ? 'copied'
-            : copyState === 'failed'
-              ? 'copy failed'
-              : 'copy link'}
+          {shareState === 'shared'
+            ? 'shared'
+            : shareState === 'copied'
+              ? 'copied'
+              : shareState === 'failed'
+                ? 'share failed'
+                : 'share'}
         </button>
       </header>
       {!online && (
