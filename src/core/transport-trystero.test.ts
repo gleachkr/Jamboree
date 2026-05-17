@@ -11,6 +11,7 @@ class FakeTrysteroRoom {
     peerId?: string;
   }> = [];
   leaveCalls = 0;
+  pingImpl: (peerId: string) => Promise<number> = () => Promise.resolve(1);
   private peerJoin: ((peerId: string) => void) | null = null;
   private peerLeave: ((peerId: string) => void) | null = null;
 
@@ -31,6 +32,14 @@ class FakeTrysteroRoom {
 
   onPeerLeave(handler: (peerId: string) => void): void {
     this.peerLeave = handler;
+  }
+
+  ping(peerId: string): Promise<number> {
+    return this.pingImpl(peerId);
+  }
+
+  getPeers(): Record<string, RTCPeerConnection> {
+    return {};
   }
 
   leave(): Promise<void> {
@@ -150,7 +159,76 @@ describe('TrysteroTransport', () => {
     transport.destroy();
   });
 
-  it('accelerates a pending rejoin when the page becomes visible', async () => {
+  it('rejoins when the only known peer stops answering pings', async () => {
+    const transport = joinJamboreeRoom({
+      roomId: 'room',
+      roomKey: 'key',
+      rejoinCooldownMs: 0,
+      peerHealthCheckIntervalMs: 100,
+      peerHealthCheckTimeoutMs: 50,
+    });
+    const firstRoom = mockTrystero.rooms[0]!;
+    const left: string[] = [];
+    transport.onPeerLeave((peerId) => left.push(peerId));
+    firstRoom.pingImpl = () => new Promise<number>(() => {});
+
+    firstRoom.emitJoin('peer_a');
+    await vi.advanceTimersByTimeAsync(150);
+
+    expect(left).toEqual(['peer_a']);
+    expect(firstRoom.leaveCalls).toBe(1);
+    expect(mockTrystero.rooms).toHaveLength(2);
+
+    transport.destroy();
+  });
+
+  it('drops stale peers without rejoining when others answer', async () => {
+    const transport = joinJamboreeRoom({
+      roomId: 'room',
+      roomKey: 'key',
+      rejoinCooldownMs: 0,
+      peerHealthCheckIntervalMs: 100,
+      peerHealthCheckTimeoutMs: 50,
+    });
+    const firstRoom = mockTrystero.rooms[0]!;
+    const left: string[] = [];
+    transport.onPeerLeave((peerId) => left.push(peerId));
+    firstRoom.pingImpl = (peerId) => {
+      if (peerId === 'peer_a') return new Promise<number>(() => {});
+      return Promise.resolve(1);
+    };
+
+    firstRoom.emitJoin('peer_a');
+    firstRoom.emitJoin('peer_b');
+    await vi.advanceTimersByTimeAsync(150);
+
+    expect(left).toEqual(['peer_a']);
+    expect(firstRoom.leaveCalls).toBe(0);
+    expect(mockTrystero.rooms).toHaveLength(1);
+
+    transport.destroy();
+  });
+
+  it('does not rejoin when known peers answer health pings', async () => {
+    const transport = joinJamboreeRoom({
+      roomId: 'room',
+      roomKey: 'key',
+      rejoinCooldownMs: 0,
+      peerHealthCheckIntervalMs: 100,
+      peerHealthCheckTimeoutMs: 50,
+    });
+    const firstRoom = mockTrystero.rooms[0]!;
+
+    firstRoom.emitJoin('peer_a');
+    await vi.advanceTimersByTimeAsync(250);
+
+    expect(firstRoom.leaveCalls).toBe(0);
+    expect(mockTrystero.rooms).toHaveLength(1);
+
+    transport.destroy();
+  });
+
+  it('accelerates a pending rejoin when page becomes visible', async () => {
     const browser = installBrowserLifecycle();
     const transport = joinJamboreeRoom({
       roomId: 'room',

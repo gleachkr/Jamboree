@@ -49,11 +49,18 @@ export type TrysteroTransportOptions = {
   // manual page refresh that users report as fixing repeering.
   zeroPeerRejoinDelayMs?: number;
   rejoinCooldownMs?: number;
+  // WebRTC stacks, especially on mobile suspend/resume paths, can leave a
+  // data channel looking present even after the remote side has dropped us.
+  // Periodic Trystero pings let us notice that stale-peer state and rejoin.
+  peerHealthCheckIntervalMs?: number;
+  peerHealthCheckTimeoutMs?: number;
 };
 
 const DEFAULT_APP_ID = 'jamboree.app';
 const DEFAULT_ZERO_PEER_REJOIN_DELAY_MS = 5_000;
 const DEFAULT_REJOIN_COOLDOWN_MS = 30_000;
+const DEFAULT_PEER_HEALTH_CHECK_INTERVAL_MS = 20_000;
+const DEFAULT_PEER_HEALTH_CHECK_TIMEOUT_MS = 8_000;
 
 export function joinJamboreeRoom(
   opts: TrysteroTransportOptions,
@@ -129,6 +136,8 @@ export class TrysteroTransport implements Transport {
   private rejoinTimerTargetMs = 0;
   private rejoinInFlight: Promise<void> | null = null;
   private lastRejoinAtMs = 0;
+  private peerHealthTimer: ReturnType<typeof setInterval> | null = null;
+  private peerHealthCheckInFlight = false;
 
   constructor(opts: {
     opts: TrysteroTransportOptions;
@@ -146,6 +155,7 @@ export class TrysteroTransport implements Transport {
     }
     this.attachRoom(opts.room);
     this.addBrowserLifecycleHandlers();
+    this.startPeerHealthChecks();
   }
 
   onPeerJoin(handler: (peerId: RemotePeerId) => void): () => void {
@@ -186,6 +196,7 @@ export class TrysteroTransport implements Transport {
     if (this.destroyed) return;
     this.destroyed = true;
     this.clearRejoinTimer();
+    this.stopPeerHealthChecks();
     this.removeBrowserLifecycleHandlers();
     this.currentPeerIds.clear();
     void this.room.leave();
@@ -214,15 +225,20 @@ export class TrysteroTransport implements Transport {
       if (this.destroyed || room !== this.room) return;
       trysteroInfo('peer join', { peerId });
       this.hasEverHadPeer = true;
+      const alreadyKnown = this.currentPeerIds.has(peerId);
       this.currentPeerIds.add(peerId);
       this.clearRejoinTimer();
-      for (const h of this.joinHandlers) h(peerId);
+      if (!alreadyKnown) {
+        for (const h of this.joinHandlers) h(peerId);
+      }
     });
     room.onPeerLeave((peerId) => {
       if (this.destroyed || room !== this.room) return;
       trysteroInfo('peer leave', { peerId });
-      this.currentPeerIds.delete(peerId);
-      for (const h of this.leaveHandlers) h(peerId);
+      const wasKnown = this.currentPeerIds.delete(peerId);
+      if (wasKnown) {
+        for (const h of this.leaveHandlers) h(peerId);
+      }
       this.scheduleZeroPeerRejoin('all peers left');
     });
   }
@@ -258,12 +274,22 @@ export class TrysteroTransport implements Transport {
 
   private async rejoinAfterZeroPeers(reason: string): Promise<void> {
     if (this.destroyed || this.currentPeerIds.size > 0) return;
+    await this.rejoinNow(reason, false);
+  }
+
+  private async rejoinNow(
+    reason: string,
+    notifyCurrentPeersLeft: boolean,
+  ): Promise<void> {
+    if (this.destroyed) return;
     if (this.rejoinInFlight) return this.rejoinInFlight;
 
+    this.clearRejoinTimer();
     this.rejoinInFlight = (async () => {
       const oldRoom = this.room;
       this.lastRejoinAtMs = Date.now();
       this.senders.clear();
+      if (notifyCurrentPeersLeft) this.markAllPeersLeft(reason);
       trysteroInfo('rejoin', { reason });
       try {
         await oldRoom.leave();
@@ -281,11 +307,91 @@ export class TrysteroTransport implements Transport {
     await this.rejoinInFlight;
   }
 
+  private markAllPeersLeft(reason: string): void {
+    this.markPeersLeft(Array.from(this.currentPeerIds), reason);
+  }
+
+  private markPeersLeft(peerIds: RemotePeerId[], reason: string): void {
+    const leftPeerIds: RemotePeerId[] = [];
+    for (const peerId of peerIds) {
+      if (this.currentPeerIds.delete(peerId)) leftPeerIds.push(peerId);
+    }
+    if (leftPeerIds.length === 0) return;
+    trysteroInfo('mark peers left', { reason, peerIds: leftPeerIds });
+    for (const peerId of leftPeerIds) {
+      for (const h of this.leaveHandlers) h(peerId);
+    }
+  }
+
   private clearRejoinTimer(): void {
     if (!this.rejoinTimer) return;
     clearTimeout(this.rejoinTimer);
     this.rejoinTimer = null;
     this.rejoinTimerTargetMs = 0;
+  }
+
+  private startPeerHealthChecks(): void {
+    if (this.peerHealthTimer) return;
+    const intervalMs = this.opts.peerHealthCheckIntervalMs
+      ?? DEFAULT_PEER_HEALTH_CHECK_INTERVAL_MS;
+    if (intervalMs <= 0) return;
+    this.peerHealthTimer = setInterval(() => {
+      void this.checkPeerHealth('periodic health check');
+    }, intervalMs);
+  }
+
+  private stopPeerHealthChecks(): void {
+    if (!this.peerHealthTimer) return;
+    clearInterval(this.peerHealthTimer);
+    this.peerHealthTimer = null;
+  }
+
+  private async checkPeerHealth(reason: string): Promise<void> {
+    if (this.destroyed || this.rejoinInFlight) return;
+    if (this.peerHealthCheckInFlight) return;
+    const peerIds = Array.from(this.currentPeerIds);
+    if (peerIds.length === 0) return;
+
+    this.peerHealthCheckInFlight = true;
+    try {
+      const health = await Promise.all(peerIds.map(async (peerId) => ({
+        peerId,
+        healthy: await this.pingPeerWithTimeout(peerId),
+      })));
+      if (this.destroyed || this.rejoinInFlight) return;
+
+      const stalePeerIds = health
+        .filter(({ healthy }) => !healthy)
+        .map(({ peerId }) => peerId);
+      if (stalePeerIds.length === 0) return;
+
+      const healthyPeerIds = health
+        .filter(({ healthy }) => healthy)
+        .map(({ peerId }) => peerId);
+      const detail = `${reason}; stale peers: ${stalePeerIds.join(', ')}`;
+      this.markPeersLeft(stalePeerIds, detail);
+      if (healthyPeerIds.length > 0) return;
+
+      await this.rejoinNow(detail, false);
+    } finally {
+      this.peerHealthCheckInFlight = false;
+    }
+  }
+
+  private async pingPeerWithTimeout(peerId: RemotePeerId): Promise<boolean> {
+    const timeoutMs = this.opts.peerHealthCheckTimeoutMs
+      ?? DEFAULT_PEER_HEALTH_CHECK_TIMEOUT_MS;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        this.room.ping(peerId).then(() => true, () => false),
+        new Promise<boolean>((resolve) => {
+          timeout = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
   }
 
   private addBrowserLifecycleHandlers(): void {
@@ -314,10 +420,12 @@ export class TrysteroTransport implements Transport {
 
   private handleBrowserOnline = (): void => {
     this.scheduleZeroPeerRejoin('browser online', 0);
+    void this.checkPeerHealth('browser online');
   };
 
   private handlePageShow = (): void => {
     this.scheduleZeroPeerRejoin('page show', 0);
+    void this.checkPeerHealth('page show');
   };
 
   private handleVisibilityChange = (): void => {
@@ -328,6 +436,7 @@ export class TrysteroTransport implements Transport {
       return;
     }
     this.scheduleZeroPeerRejoin('page visible', 0);
+    void this.checkPeerHealth('page visible');
   };
 }
 
