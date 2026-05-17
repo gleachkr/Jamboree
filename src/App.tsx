@@ -348,25 +348,30 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
         </p>
       )}
 
+      {/* Keep playback mounted while the Room tab is shown. The hidden audio
+          element, media warmup effects, Media Session handlers, and ended
+          handler are all owned by PlaybackPanel, so unmounting it would stop
+          local playback and detach playback side effects. */}
+      <div hidden={activeTab !== 'player'}>
+        <PlaybackPanel
+          room={room}
+          derived={derived}
+          media={media}
+          audioRef={audioRef}
+          gestureUnlock={gestureUnlock}
+        />
+      </div>
+
       {activeTab === 'player' && (
-        <>
-          <PlaybackPanel
-            room={room}
-            derived={derived}
-            media={media}
-            audioRef={audioRef}
-            gestureUnlock={gestureUnlock}
-          />
-          <QueuePanel
-            room={room}
-            derived={derived}
-            media={media}
-            gestureUnlock={gestureUnlock}
-            onUploadClick={upload.openFilePicker}
-            uploadBusy={upload.busy}
-            uploadError={upload.error}
-          />
-        </>
+        <QueuePanel
+          room={room}
+          derived={derived}
+          media={media}
+          gestureUnlock={gestureUnlock}
+          onUploadClick={upload.openFilePicker}
+          uploadBusy={upload.busy}
+          uploadError={upload.error}
+        />
       )}
 
       {activeTab === 'room' && (
