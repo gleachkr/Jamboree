@@ -250,6 +250,7 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
   const derived = room.derivedState();
   const snap = room.snapshot();
   const peerStates = Array.from(awareness.getStates().entries());
+  const peerNames = peerDisplayNames(peerStates);
   const remotePeerCount = provider.getRemotePeers().size;
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const online = useOnline();
@@ -367,6 +368,7 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
           room={room}
           derived={derived}
           media={media}
+          peerNames={peerNames}
           gestureUnlock={gestureUnlock}
           onUploadClick={upload.openFilePicker}
           uploadBusy={upload.busy}
@@ -378,7 +380,7 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
         <>
           <RoomInfoPanel invite={invite} />
           <PeersPanel awareness={awareness} peerStates={peerStates} />
-          <ActivityPanel room={room} />
+          <ActivityPanel room={room} peerNames={peerNames} />
         </>
       )}
     </main>
@@ -388,6 +390,25 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
 function batchIdsFingerprint(batches: ReadonlyMap<string, Batch>): string {
   const ids = Array.from(batches.keys()).sort();
   return ids.join('|');
+}
+
+function peerDisplayNames(
+  peerStates: Array<[number, Record<string, unknown>]>,
+): ReadonlyMap<string, string> {
+  const names = new Map<string, string>();
+  for (const [, state] of peerStates) {
+    if (typeof state.peerId !== 'string') continue;
+    const name = typeof state.name === 'string' ? state.name.trim() : '';
+    if (name.length > 0) names.set(state.peerId, name);
+  }
+  return names;
+}
+
+function displayNameForPeer(
+  peerId: string,
+  peerNames: ReadonlyMap<string, string>,
+): string {
+  return peerNames.get(peerId) ?? shortPeer(peerId);
 }
 
 function TabNav({
@@ -1010,6 +1031,7 @@ function QueuePanel({
   room,
   derived,
   media,
+  peerNames,
   gestureUnlock,
   onUploadClick,
   uploadBusy,
@@ -1018,6 +1040,7 @@ function QueuePanel({
   room: JamboreeRoom;
   derived: DerivedPlaybackState;
   media: MediaCache;
+  peerNames: ReadonlyMap<string, string>;
   gestureUnlock: () => void;
   onUploadClick: () => void;
   uploadBusy: string | null;
@@ -1085,6 +1108,10 @@ function QueuePanel({
                     meta={meta}
                     status={status}
                     isCurrent={isCurrent}
+                    addedBy={displayNameForPeer(
+                      entry.addedByPeerId,
+                      peerNames,
+                    )}
                     onSelect={() => {
                       gestureUnlock();
                       room.selectEntry(entry.entryId);
@@ -1118,6 +1145,7 @@ function SortableQueueRow({
   meta,
   status,
   isCurrent,
+  addedBy,
   onSelect,
   onRemove,
 }: {
@@ -1125,6 +1153,7 @@ function SortableQueueRow({
   meta: TrackMeta | undefined;
   status: FileStatus | null;
   isCurrent: boolean;
+  addedBy: string;
   onSelect: () => void;
   onRemove: () => void;
 }) {
@@ -1168,7 +1197,7 @@ function SortableQueueRow({
           <strong>{meta?.title ?? '(missing)'}</strong>
         </div>
         <div className="queue-sub muted small">
-          {shortPeer(entry.addedByPeerId)}
+          <span title={entry.addedByPeerId}>Added by {addedBy}</span>
           {status && (
             <>
               {' · '}
@@ -1308,7 +1337,13 @@ function isAudioFile(f: File): boolean {
   return /\.(mp3|m4a|mp4|aac|flac|ogg|opus|wav|webm)$/i.test(f.name);
 }
 
-function ActivityPanel({ room }: { room: JamboreeRoom }) {
+function ActivityPanel({
+  room,
+  peerNames,
+}: {
+  room: JamboreeRoom;
+  peerNames: ReadonlyMap<string, string>;
+}) {
   const items = room.activity().slice(-12).reverse();
   return (
     <section className="panel">
@@ -1318,7 +1353,7 @@ function ActivityPanel({ room }: { room: JamboreeRoom }) {
       ) : (
         <ul className="activity">
           {items.map((item) => (
-            <li key={item.id}>{describeActivity(item)}</li>
+            <li key={item.id}>{describeActivity(item, peerNames)}</li>
           ))}
         </ul>
       )}
@@ -1326,8 +1361,11 @@ function ActivityPanel({ room }: { room: JamboreeRoom }) {
   );
 }
 
-function describeActivity(item: ActivityRecord): string {
-  const who = shortPeer(item.peerId);
+function describeActivity(
+  item: ActivityRecord,
+  peerNames: ReadonlyMap<string, string>,
+): string {
+  const who = displayNameForPeer(item.peerId, peerNames);
   switch (item.kind) {
     case 'track-added':
       return `${who} added a track`;
