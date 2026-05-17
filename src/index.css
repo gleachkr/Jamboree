@@ -209,6 +209,29 @@ code {
   border-top: 0;
 }
 
+.room-details {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.room-details div {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.room-details dt {
+  color: var(--muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.room-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 .player-details {
   display: grid;
   gap: 0.8rem;

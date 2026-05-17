@@ -376,6 +376,7 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
 
       {activeTab === 'room' && (
         <>
+          <RoomInfoPanel invite={invite} />
           <PeersPanel awareness={awareness} peerStates={peerStates} />
           <ActivityPanel room={room} />
         </>
@@ -426,6 +427,24 @@ function TabNav({
         </button>
       ))}
     </nav>
+  );
+}
+
+function RoomInfoPanel({ invite }: { invite: RoomInvite }) {
+  return (
+    <section className="panel room-info-panel">
+      <h2>Room</h2>
+      <dl className="room-details">
+        <div>
+          <dt>Name</dt>
+          <dd className="mono">{invite.roomId}</dd>
+        </div>
+        <div>
+          <dt>Key</dt>
+          <dd className="mono">{invite.key}</dd>
+        </div>
+      </dl>
+    </section>
   );
 }
 
