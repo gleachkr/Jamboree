@@ -1034,7 +1034,6 @@ function QueuePanel({
 
   return (
     <section className="panel queue-panel">
-      <h2>Queue ({snap.queue.length})</h2>
       {snap.queue.length === 0 ? (
         <p className="muted italic">
           Queue is empty. Drop audio anywhere in the window to add tracks.
