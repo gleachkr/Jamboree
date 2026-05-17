@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { Awareness } from 'y-protocols/awareness';
 import {
   DndContext,
@@ -70,6 +70,31 @@ function persistName(value: string): void {
   void setPref(NAME_PREF_KEY, value);
 }
 
+async function copyText(value: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {
+    // Fall through to the textarea fallback below.
+  }
+  try {
+    const textarea = document.createElement('textarea');
+    textarea.value = value;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body.append(textarea);
+    textarea.select();
+    const ok = document.execCommand('copy');
+    textarea.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 function useOnline(): boolean {
   const [online, setOnline] = useState(() =>
     typeof navigator === 'undefined' ? true : navigator.onLine,
@@ -118,6 +143,8 @@ type RoomState = {
   media: MediaCache;
   transport: Transport;
 };
+
+type AppTab = 'player' | 'room';
 
 function Room({ invite }: { invite: RoomInvite }) {
   const [state, setState] = useState<RoomState | null>(null);
@@ -193,6 +220,18 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
   const remotePeerCount = provider.getRemotePeers().size;
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const online = useOnline();
+  const [activeTab, setActiveTab] = useState<AppTab>('player');
+  const upload = useTrackIngest(room, media);
+  const viewportDragOver = useViewportFileDrop(upload.ingestFiles);
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>(
+    'idle',
+  );
+
+  async function copyInvite() {
+    const ok = await copyText(inviteUrl);
+    setCopyState(ok ? 'copied' : 'failed');
+    window.setTimeout(() => setCopyState('idle'), 1600);
+  }
 
   // Browsers tie media autoplay to a user-activation token that only lives
   // synchronously inside the gesture handler. Most of our user actions go
@@ -224,41 +263,83 @@ function RoomBody({ invite, state }: { invite: RoomInvite; state: RoomState }) {
   }, [media, batchIdsFingerprint(snap.batches)]);
 
   return (
-    <main>
-      <header className="room-header">
-        <h1>Jamboree</h1>
-        <ConnectionPill remotePeerCount={remotePeerCount} online={online} />
+    <main className="app-shell">
+      <input
+        ref={upload.fileInputRef}
+        type="file"
+        accept="audio/*"
+        multiple
+        hidden
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? []);
+          void upload.ingestFiles(files);
+          e.target.value = '';
+        }}
+      />
+      {viewportDragOver && (
+        <div className="drop-overlay" aria-live="polite">
+          <div className="drop-overlay-message">Drop audio to add it</div>
+        </div>
+      )}
+
+      <header className="app-nav">
+        <div className="brand" aria-label="Jamboree">
+          <span className="brand-full">Jamboree</span>
+          <span className="brand-icon" aria-hidden="true">[J]</span>
+        </div>
+        <TabNav
+          activeTab={activeTab}
+          online={online}
+          remotePeerCount={remotePeerCount}
+          onChange={setActiveTab}
+        />
+        <button
+          type="button"
+          className="copy-link"
+          onClick={copyInvite}
+          aria-label="Copy room link"
+        >
+          {copyState === 'copied'
+            ? 'copied'
+            : copyState === 'failed'
+              ? 'copy failed'
+              : 'copy link'}
+        </button>
       </header>
-      <p>
-        Room: <strong>{invite.roomId}</strong>
-      </p>
       {!online && (
         <p className="offline-banner small">
           You're offline. Jamboree rooms need active network peers — reconnect
           to join others.
         </p>
       )}
-      <details>
-        <summary>Share link</summary>
-        <code>{inviteUrl}</code>
-      </details>
 
-      <PeersPanel awareness={awareness} peerStates={peerStates} />
-      <PlaybackPanel
-        room={room}
-        derived={derived}
-        media={media}
-        audioRef={audioRef}
-        gestureUnlock={gestureUnlock}
-      />
-      <IngestPanel room={room} media={media} />
-      <QueuePanel
-        room={room}
-        derived={derived}
-        media={media}
-        gestureUnlock={gestureUnlock}
-      />
-      <ActivityPanel room={room} />
+      {activeTab === 'player' && (
+        <>
+          <PlaybackPanel
+            room={room}
+            derived={derived}
+            media={media}
+            audioRef={audioRef}
+            gestureUnlock={gestureUnlock}
+          />
+          <QueuePanel
+            room={room}
+            derived={derived}
+            media={media}
+            gestureUnlock={gestureUnlock}
+            onUploadClick={upload.openFilePicker}
+            uploadBusy={upload.busy}
+            uploadError={upload.error}
+          />
+        </>
+      )}
+
+      {activeTab === 'room' && (
+        <>
+          <PeersPanel awareness={awareness} peerStates={peerStates} />
+          <ActivityPanel room={room} />
+        </>
+      )}
     </main>
   );
 }
@@ -268,34 +349,43 @@ function batchIdsFingerprint(batches: ReadonlyMap<string, Batch>): string {
   return ids.join('|');
 }
 
-function ConnectionPill({
-  remotePeerCount,
+function TabNav({
+  activeTab,
   online,
+  remotePeerCount,
+  onChange,
 }: {
-  remotePeerCount: number;
+  activeTab: AppTab;
   online: boolean;
+  remotePeerCount: number;
+  onChange: (tab: AppTab) => void;
 }) {
-  if (!online) {
-    return (
-      <span className="conn-pill conn-pill--offline">
-        <span className="conn-dot" />
-        Offline
-      </span>
-    );
-  }
-  if (remotePeerCount === 0) {
-    return (
-      <span className="conn-pill conn-pill--searching">
-        <span className="conn-dot" />
-        Searching for peers…
-      </span>
-    );
-  }
+  const tabs: Array<{ id: AppTab; label: string; meta?: string }> = [
+    { id: 'player', label: 'Player' },
+    {
+      id: 'room',
+      label: 'Room',
+      meta: online
+        ? `${remotePeerCount} ${peerWord(remotePeerCount)}`
+        : 'offline',
+    },
+  ];
   return (
-    <span className="conn-pill conn-pill--connected">
-      <span className="conn-dot" />
-      Connected · {remotePeerCount} {remotePeerCount === 1 ? 'peer' : 'peers'}
-    </span>
+    <nav className="tab-nav" role="tablist" aria-label="Room sections">
+      {tabs.map((tab) => (
+        <button
+          key={tab.id}
+          type="button"
+          className={`tab-button${activeTab === tab.id ? ' active' : ''}`}
+          role="tab"
+          aria-selected={activeTab === tab.id}
+          onClick={() => onChange(tab.id)}
+        >
+          <span>{tab.label}</span>
+          {tab.meta && <span className="tab-meta">{tab.meta}</span>}
+        </button>
+      ))}
+    </nav>
   );
 }
 
@@ -350,6 +440,59 @@ function PeersPanel({
   );
 }
 
+type TransportIconName =
+  | 'next'
+  | 'pause'
+  | 'play'
+  | 'previous'
+  | 'seekBack'
+  | 'seekForward'
+  | 'stop';
+
+function TransportIcon({ name }: { name: TransportIconName }) {
+  return (
+    <svg
+      aria-hidden="true"
+      className="transport-icon"
+      fill="none"
+      viewBox="0 0 24 24"
+    >
+      {name === 'previous' && (
+        <>
+          <path d="M6 5v14" />
+          <path d="m18 6-9 6 9 6V6Z" />
+        </>
+      )}
+      {name === 'next' && (
+        <>
+          <path d="M18 5v14" />
+          <path d="m6 6 9 6-9 6V6Z" />
+        </>
+      )}
+      {name === 'play' && <path d="m8 5 11 7-11 7V5Z" />}
+      {name === 'pause' && (
+        <>
+          <path d="M8 5v14" />
+          <path d="M16 5v14" />
+        </>
+      )}
+      {name === 'stop' && <path d="M7 7h10v10H7z" />}
+      {name === 'seekBack' && (
+        <>
+          <path d="M9 7H5v4" />
+          <path d="M5 11a7 7 0 1 0 2-5" />
+        </>
+      )}
+      {name === 'seekForward' && (
+        <>
+          <path d="M15 7h4v4" />
+          <path d="M19 11a7 7 0 1 1-2-5" />
+        </>
+      )}
+    </svg>
+  );
+}
+
 function PlaybackPanel({
   room,
   derived,
@@ -366,6 +509,7 @@ function PlaybackPanel({
   const [, tick] = useReducer((x: number) => x + 1, 0);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
+  const [audioDurationMs, setAudioDurationMs] = useState<number | null>(null);
 
   // Re-render every 250ms while playing so the audio element's currentTime
   // and the buffer-bar progress stay live in the UI. (Position is read
@@ -388,6 +532,7 @@ function PlaybackPanel({
   const playUrl = fileStatus?.kind === 'ready' ? fileStatus.url : null;
   const bufferProgress =
     fileStatus?.kind === 'downloading' ? fileStatus.progress : null;
+  const totalDurationMs = currentTrack?.durationMs ?? audioDurationMs;
 
   // Resolve the next not-ready queue entry/track for serial warmup. Only one
   // non-active file is prefetched at LOW priority at a time; once it is
@@ -411,6 +556,10 @@ function PlaybackPanel({
   useEffect(() => {
     media.setUpcoming(nextRef);
   }, [media, nextRef?.contentId, nextRef?.fileIndex]);
+
+  useEffect(() => {
+    setAudioDurationMs(null);
+  }, [currentTrack?.id, playUrl]);
 
   // Slave the audio element to the room's playback intent. We re-anchor on
   // every change to sourceIntentId — that captures play/pause/seek/select
@@ -509,7 +658,7 @@ function PlaybackPanel({
       try { ms.setPositionState({}); } catch { /* ignore */ }
       return;
     }
-    const duration = (currentTrack.durationMs ?? 0) / 1000;
+    const duration = ((currentTrack.durationMs ?? audioDurationMs) ?? 0) / 1000;
     try {
       ms.setPositionState({
         duration: duration > 0 ? duration : 0,
@@ -525,6 +674,7 @@ function PlaybackPanel({
     derived.sourceIntentId,
     currentTrack?.id,
     currentTrack?.durationMs,
+    audioDurationMs,
   ]);
 
   useEffect(() => {
@@ -598,34 +748,49 @@ function PlaybackPanel({
     gestureUnlock();
     room.seek(targetMs);
   }
+  function syncAudioDuration() {
+    const duration = audioRef.current?.duration;
+    setAudioDurationMs(
+      typeof duration === 'number' && Number.isFinite(duration)
+        ? duration * 1000
+        : null,
+    );
+  }
 
-  // Read position straight off the audio element. We only have meaningful
-  // information once metadata has loaded; before that (and once the room
-  // intent is 'stopped', which resets currentTime to 0) we surface nothing
-  // rather than running an intent-based fake timer.
+  // Read position straight off the audio element when possible. Before the
+  // media element has metadata, fall back to the pure playback reducer so the
+  // displayed timer still reflects room intent without writing to Yjs.
   const audioEl = audioRef.current;
   const positionMs =
     audioEl && audioEl.readyState >= 1 && derived.status !== 'stopped'
       ? audioEl.currentTime * 1000
       : null;
+  const displayPositionMs = currentTrack
+    ? positionMs ?? currentPositionMs(derived, Date.now())
+    : 0;
+  const progressPct = totalDurationMs
+    ? Math.max(0, Math.min(100, (displayPositionMs / totalDurationMs) * 100))
+    : 0;
+  const canSeek = Boolean(currentTrack) && derived.status !== 'stopped';
 
   return (
-    <section className="panel">
-      <h2>Playback</h2>
-      <div className="now-playing">
-        <div>
-          Status: <strong>{derived.status}</strong>
+    <section className="panel playback-panel">
+      <div className="player-details">
+        <div className="player-meta">
+          <span className="status-chip">{derived.status}</span>
+          <h2>{currentTrack?.title ?? 'No track selected'}</h2>
+          {currentTrack && fileStatus && (
+            <div className="muted small">{describeStatus(fileStatus)}</div>
+          )}
         </div>
-        <div>
-          Track: <strong>{currentTrack?.title ?? '—'}</strong>
+        <div className="time-row" aria-label="Playback time">
+          <span>{formatMs(displayPositionMs)}</span>
+          <span>{totalDurationMs ? formatMs(totalDurationMs) : '—:—'}</span>
         </div>
-        <div>Position: {positionMs !== null ? formatMs(positionMs) : '—'}</div>
-        {currentTrack && fileStatus && (
-          <div className="muted small">{describeStatus(fileStatus)}</div>
-        )}
-        {bufferProgress !== null && (
-          <BufferBar progress={bufferProgress} />
-        )}
+        <div className="playback-meter" aria-hidden="true">
+          <div className="playback-meter-fill" style={{ width: `${progressPct}%` }} />
+        </div>
+        {bufferProgress !== null && <BufferBar progress={bufferProgress} />}
       </div>
       {/* Hidden — playback is driven by the room's intent state, surfaced
           via the buttons below. The element still emits errors, which we
@@ -634,6 +799,8 @@ function PlaybackPanel({
         ref={audioRef}
         src={playUrl ?? undefined}
         preload="auto"
+        onLoadedMetadata={syncAudioDuration}
+        onDurationChange={syncAudioDuration}
         onEnded={onTrackEnded}
         onError={() => {
           const err = audioRef.current?.error;
@@ -656,34 +823,77 @@ function PlaybackPanel({
           </button>
         </p>
       )}
-      {audioError && (
-        <p className="small" style={{ color: 'crimson' }}>{audioError}</p>
-      )}
-      <div className="row">
-        <button onClick={onSkipPrevious}>Previous</button>
-        {derived.status === 'playing' ? (
-          <button onClick={onPause}>Pause</button>
-        ) : (
-          <button onClick={onPlay}>Play</button>
-        )}
-        <button onClick={onSkipNext}>Next</button>
-        <button onClick={() => room.stop()}>Stop</button>
+      {audioError && <p className="error-text small">{audioError}</p>}
+      <div className="transport-controls" aria-label="Playback controls">
         <button
-          disabled={positionMs === null}
-          onClick={() =>
-            positionMs !== null &&
-            onSelectViaSeek(Math.max(0, positionMs - 10_000))
-          }
+          type="button"
+          className="icon-button"
+          onClick={onSkipPrevious}
+          aria-label="Previous track"
+          title="Previous track"
         >
-          -10s
+          <TransportIcon name="previous" />
+        </button>
+        {derived.status === 'playing' ? (
+          <button
+            type="button"
+            className="icon-button primary"
+            onClick={onPause}
+            aria-label="Pause"
+            title="Pause"
+          >
+            <TransportIcon name="pause" />
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="icon-button primary"
+            onClick={onPlay}
+            aria-label="Play"
+            title="Play"
+          >
+            <TransportIcon name="play" />
+          </button>
+        )}
+        <button
+          type="button"
+          className="icon-button"
+          onClick={onSkipNext}
+          aria-label="Next track"
+          title="Next track"
+        >
+          <TransportIcon name="next" />
         </button>
         <button
-          disabled={positionMs === null}
-          onClick={() =>
-            positionMs !== null && onSelectViaSeek(positionMs + 30_000)
-          }
+          type="button"
+          className="icon-button"
+          onClick={() => room.stop()}
+          aria-label="Stop"
+          title="Stop"
         >
-          +30s
+          <TransportIcon name="stop" />
+        </button>
+        <button
+          type="button"
+          className="icon-button small-icon"
+          disabled={!canSeek}
+          onClick={() => onSelectViaSeek(Math.max(0, displayPositionMs - 10_000))}
+          aria-label="Seek back 10 seconds"
+          title="Seek back 10 seconds"
+        >
+          <TransportIcon name="seekBack" />
+          <span>10</span>
+        </button>
+        <button
+          type="button"
+          className="icon-button small-icon"
+          disabled={!canSeek}
+          onClick={() => onSelectViaSeek(displayPositionMs + 30_000)}
+          aria-label="Seek forward 30 seconds"
+          title="Seek forward 30 seconds"
+        >
+          <span>30</span>
+          <TransportIcon name="seekForward" />
         </button>
       </div>
     </section>
@@ -742,11 +952,17 @@ function QueuePanel({
   derived,
   media,
   gestureUnlock,
+  onUploadClick,
+  uploadBusy,
+  uploadError,
 }: {
   room: JamboreeRoom;
   derived: DerivedPlaybackState;
   media: MediaCache;
   gestureUnlock: () => void;
+  onUploadClick: () => void;
+  uploadBusy: string | null;
+  uploadError: string | null;
 }) {
   // Self-tick every 250ms so queue-row BufferBars animate smoothly even when
   // the upstream media.subscribe → force() chain coalesces or drops updates
@@ -782,10 +998,12 @@ function QueuePanel({
   const ids = snap.queue.map((e) => e.entryId);
 
   return (
-    <section className="panel">
+    <section className="panel queue-panel">
       <h2>Queue ({snap.queue.length})</h2>
       {snap.queue.length === 0 ? (
-        <p className="muted italic">Queue is empty. Drop an audio file above.</p>
+        <p className="muted italic">
+          Queue is empty. Drop audio anywhere in the window to add tracks.
+        </p>
       ) : (
         <DndContext
           sensors={sensors}
@@ -821,6 +1039,18 @@ function QueuePanel({
           </SortableContext>
         </DndContext>
       )}
+      <div className="queue-upload-footer">
+        <button
+          type="button"
+          className="upload-link"
+          onClick={onUploadClick}
+          disabled={uploadBusy !== null}
+        >
+          + upload
+        </button>
+        {uploadBusy && <span className="muted small">{uploadBusy}</span>}
+        {uploadError && <span className="error-text small">{uploadError}</span>}
+      </div>
     </section>
   );
 }
@@ -876,7 +1106,7 @@ function SortableQueueRow({
         aria-label={`Select ${meta?.title ?? 'track'}`}
       >
         <div className="queue-title">
-          {isCurrent ? '▶ ' : ''}
+          {isCurrent && <span className="current-marker" aria-hidden="true" />}
           <strong>{meta?.title ?? '(missing)'}</strong>
         </div>
         <div className="queue-sub muted small">
@@ -906,16 +1136,15 @@ function SortableQueueRow({
   );
 }
 
-function IngestPanel({ room, media }: { room: JamboreeRoom; media: MediaCache }) {
+function useTrackIngest(room: JamboreeRoom, media: MediaCache) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Whole-drop ingestion: every file the user drops in a single gesture
   // becomes one Batch in the doc. Receivers only request chunks for whichever
   // file is selected as current/upcoming.
-  async function ingestFiles(rawFiles: File[]) {
+  const ingestFiles = useCallback(async (rawFiles: File[]) => {
     const files = rawFiles.filter(isAudioFile);
     if (files.length === 0) {
       if (rawFiles.length > 0) setError('No audio files in the drop.');
@@ -947,51 +1176,66 @@ function IngestPanel({ room, media }: { room: JamboreeRoom; media: MediaCache })
     } finally {
       setBusy(null);
     }
-  }
+  }, [media, room]);
 
-  function onDrop(e: React.DragEvent) {
-    e.preventDefault();
-    setDragOver(false);
-    const files = Array.from(e.dataTransfer.files);
-    void ingestFiles(files);
-  }
+  const openFilePicker = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
 
-  return (
-    <section className="panel">
-      <h2>Add tracks</h2>
-      <div
-        className={`dropzone${dragOver ? ' dragover' : ''}`}
-        onDragOver={(e) => {
-          e.preventDefault();
-          setDragOver(true);
-        }}
-        onDragLeave={() => setDragOver(false)}
-        onDrop={onDrop}
-        onClick={() => fileInputRef.current?.click()}
-        role="button"
-        tabIndex={0}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') fileInputRef.current?.click();
-        }}
-      >
-        Drop audio files here, or click to choose.
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="audio/*"
-          multiple
-          hidden
-          onChange={(e) => {
-            const files = Array.from(e.target.files ?? []);
-            void ingestFiles(files);
-            e.target.value = '';
-          }}
-        />
-      </div>
-      {busy && <p className="muted small">{busy}</p>}
-      {error && <p className="small" style={{ color: 'crimson' }}>{error}</p>}
-    </section>
-  );
+  return { busy, error, fileInputRef, ingestFiles, openFilePicker };
+}
+
+function useViewportFileDrop(ingestFiles: (files: File[]) => void | Promise<void>) {
+  const [dragOver, setDragOver] = useState(false);
+
+  useEffect(() => {
+    let depth = 0;
+
+    function onDragEnter(e: DragEvent) {
+      if (!eventHasFiles(e)) return;
+      e.preventDefault();
+      depth += 1;
+      setDragOver(true);
+    }
+
+    function onDragOver(e: DragEvent) {
+      if (!eventHasFiles(e)) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+      setDragOver(true);
+    }
+
+    function onDragLeave(e: DragEvent) {
+      if (!eventHasFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) setDragOver(false);
+    }
+
+    function onDrop(e: DragEvent) {
+      if (!eventHasFiles(e)) return;
+      e.preventDefault();
+      depth = 0;
+      setDragOver(false);
+      void ingestFiles(Array.from(e.dataTransfer?.files ?? []));
+    }
+
+    window.addEventListener('dragenter', onDragEnter);
+    window.addEventListener('dragover', onDragOver);
+    window.addEventListener('dragleave', onDragLeave);
+    window.addEventListener('drop', onDrop);
+    return () => {
+      window.removeEventListener('dragenter', onDragEnter);
+      window.removeEventListener('dragover', onDragOver);
+      window.removeEventListener('dragleave', onDragLeave);
+      window.removeEventListener('drop', onDrop);
+    };
+  }, [ingestFiles]);
+
+  return dragOver;
+}
+
+function eventHasFiles(e: DragEvent): boolean {
+  return Array.from(e.dataTransfer?.types ?? []).includes('Files');
 }
 
 function describeError(e: unknown): string {
@@ -1008,15 +1252,18 @@ function isAudioFile(f: File): boolean {
 
 function ActivityPanel({ room }: { room: JamboreeRoom }) {
   const items = room.activity().slice(-12).reverse();
-  if (items.length === 0) return null;
   return (
     <section className="panel">
       <h2>Activity</h2>
-      <ul className="activity">
-        {items.map((item) => (
-          <li key={item.id}>{describeActivity(item)}</li>
-        ))}
-      </ul>
+      {items.length === 0 ? (
+        <p className="muted italic">No room events yet.</p>
+      ) : (
+        <ul className="activity">
+          {items.map((item) => (
+            <li key={item.id}>{describeActivity(item)}</li>
+          ))}
+        </ul>
+      )}
     </section>
   );
 }
