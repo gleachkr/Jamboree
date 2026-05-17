@@ -10,6 +10,7 @@ function intent(fields: Partial<PlaybackIntent> & Pick<PlaybackIntent, 'kind' | 
     peerId: fields.peerId ?? 'peer_a',
     kind: fields.kind,
     queueEntryId: fields.queueEntryId,
+    targetQueueEntryId: fields.targetQueueEntryId,
     positionMs: fields.positionMs,
     createdAtWallMs: fields.createdAtWallMs,
     localSeq: fields.localSeq ?? intentSeq,
@@ -108,7 +109,12 @@ describe('derivePlaybackState', () => {
       queue,
       intents: [
         intent({ kind: 'play', queueEntryId: 'e1', createdAtWallMs: 1000 }),
-        intent({ kind: 'skip-next', createdAtWallMs: 2000 }),
+        intent({
+          kind: 'skip-next',
+          queueEntryId: 'e1',
+          targetQueueEntryId: 'e2',
+          createdAtWallMs: 2000,
+        }),
       ],
     }));
     expect(state.queueEntryId).toBe('e2');
@@ -121,12 +127,75 @@ describe('derivePlaybackState', () => {
       queue,
       intents: [
         intent({ kind: 'play', queueEntryId: 'e1', createdAtWallMs: 1000 }),
-        intent({ kind: 'skip-next', queueEntryId: 'e1', createdAtWallMs: 2000 }),
-        intent({ kind: 'skip-next', queueEntryId: 'e1', createdAtWallMs: 3000 }),
+        intent({
+          kind: 'skip-next',
+          queueEntryId: 'e1',
+          targetQueueEntryId: 'e2',
+          createdAtWallMs: 2000,
+        }),
+        intent({
+          kind: 'skip-next',
+          queueEntryId: 'e1',
+          targetQueueEntryId: 'e3',
+          createdAtWallMs: 3000,
+        }),
       ],
     }));
     expect(state.queueEntryId).toBe('e2');
     expect(state.status).toBe('playing');
+  });
+
+  it('resolved skip-next survives removal of its source entry', () => {
+    const state = derivePlaybackState(snapshot({
+      queue: [entry('e2', 't2'), entry('e3', 't3')],
+      intents: [
+        intent({ kind: 'play', queueEntryId: 'e1', createdAtWallMs: 1000 }),
+        intent({
+          kind: 'skip-next',
+          queueEntryId: 'e1',
+          targetQueueEntryId: 'e2',
+          createdAtWallMs: 2000,
+        }),
+      ],
+    }));
+    expect(state.status).toBe('playing');
+    expect(state.queueEntryId).toBe('e2');
+  });
+
+  it('resolved skip-next stops when its target entry is removed', () => {
+    const state = derivePlaybackState(snapshot({
+      queue: [entry('e1', 't1'), entry('e3', 't3')],
+      intents: [
+        intent({ kind: 'play', queueEntryId: 'e1', createdAtWallMs: 1000 }),
+        intent({
+          kind: 'skip-next',
+          queueEntryId: 'e1',
+          targetQueueEntryId: 'e2',
+          createdAtWallMs: 2000,
+        }),
+      ],
+    }));
+    expect(state.status).toBe('stopped');
+    expect(state.queueEntryId).toBeUndefined();
+  });
+
+  it('resolved skip-next respects its source guard when source remains', () => {
+    const queue = [entry('e1', 't1'), entry('e2', 't2')];
+    const state = derivePlaybackState(snapshot({
+      queue,
+      intents: [
+        intent({ kind: 'play', queueEntryId: 'e1', createdAtWallMs: 1000 }),
+        intent({ kind: 'stop', createdAtWallMs: 1500 }),
+        intent({
+          kind: 'skip-next',
+          queueEntryId: 'e1',
+          targetQueueEntryId: 'e2',
+          createdAtWallMs: 2000,
+        }),
+      ],
+    }));
+    expect(state.status).toBe('stopped');
+    expect(state.queueEntryId).toBeUndefined();
   });
 
   it('skip-next at end of queue stops playback', () => {
@@ -135,7 +204,12 @@ describe('derivePlaybackState', () => {
       queue,
       intents: [
         intent({ kind: 'play', queueEntryId: 'e1', createdAtWallMs: 1000 }),
-        intent({ kind: 'skip-next', createdAtWallMs: 2000 }),
+        intent({
+          kind: 'skip-next',
+          queueEntryId: 'e1',
+          targetQueueEntryId: null,
+          createdAtWallMs: 2000,
+        }),
       ],
     }));
     expect(state.status).toBe('stopped');

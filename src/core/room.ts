@@ -235,9 +235,13 @@ export class JamboreeRoom {
   // --- playback intent commands ---------------------------------------------
 
   play(opts: { entryId?: QueueEntryId; positionMs?: number } = {}): IntentId {
+    const target =
+      opts.entryId ??
+      this.derivedState().queueEntryId ??
+      this.queueArray().get(0)?.entryId;
     return this.appendIntent({
       kind: 'play',
-      queueEntryId: opts.entryId,
+      queueEntryId: target,
       positionMs: opts.positionMs,
     });
   }
@@ -263,17 +267,11 @@ export class JamboreeRoom {
   }
 
   skipNext(opts: { fromEntryId?: QueueEntryId } = {}): IntentId {
-    return this.appendIntent({
-      kind: 'skip-next',
-      queueEntryId: opts.fromEntryId,
-    });
+    return this.appendSkipIntent('skip-next', +1, opts.fromEntryId);
   }
 
   skipPrevious(opts: { fromEntryId?: QueueEntryId } = {}): IntentId {
-    return this.appendIntent({
-      kind: 'skip-previous',
-      queueEntryId: opts.fromEntryId,
-    });
+    return this.appendSkipIntent('skip-previous', -1, opts.fromEntryId);
   }
 
   stop(): IntentId {
@@ -321,9 +319,27 @@ export class JamboreeRoom {
     return undefined;
   }
 
+  private appendSkipIntent(
+    kind: Extract<PlaybackIntentKind, 'skip-next' | 'skip-previous'>,
+    direction: 1 | -1,
+    fromEntryId?: QueueEntryId,
+  ): IntentId {
+    const current = fromEntryId ?? this.derivedState().queueEntryId;
+    const target = queueNeighbor(
+      this.queueArray().toArray(),
+      current,
+      direction,
+    );
+    return this.appendIntent({
+      kind,
+      queueEntryId: current,
+      targetQueueEntryId: target?.entryId ?? null,
+    });
+  }
+
   private appendIntent(
     fields: { kind: PlaybackIntentKind } & Partial<
-      Pick<PlaybackIntent, 'queueEntryId' | 'positionMs'>
+      Pick<PlaybackIntent, 'queueEntryId' | 'targetQueueEntryId' | 'positionMs'>
     >,
   ): IntentId {
     const id = randomId('intent');
@@ -332,6 +348,7 @@ export class JamboreeRoom {
       peerId: this.peerId,
       kind: fields.kind,
       queueEntryId: fields.queueEntryId,
+      targetQueueEntryId: fields.targetQueueEntryId,
       positionMs: fields.positionMs,
       createdAtWallMs: this.now(),
       localSeq: this.nextSeq(),
@@ -377,6 +394,18 @@ export class JamboreeRoom {
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(Math.max(n, lo), hi);
+}
+
+function queueNeighbor(
+  queue: readonly QueueEntry[],
+  currentEntryId: string | undefined,
+  direction: 1 | -1,
+): QueueEntry | undefined {
+  if (queue.length === 0) return undefined;
+  if (!currentEntryId) return direction > 0 ? queue[0] : queue[queue.length - 1];
+  const idx = queue.findIndex((e) => e.entryId === currentEntryId);
+  if (idx < 0) return undefined;
+  return queue[idx + direction];
 }
 
 function randomId(prefix: string): string {

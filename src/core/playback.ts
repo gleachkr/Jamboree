@@ -112,35 +112,50 @@ function applyIntent(
       };
     }
 
-    case 'skip-next': {
-      if (!matchesExpectedEntry(prior, intent)) return prior;
-      const next = neighbor(queue, prior.queueEntryId, +1);
-      if (!next) return { ...STOPPED, effectiveAtWallMs: t, sourceIntentId: intent.id };
-      return {
-        status: 'playing',
-        queueEntryId: next.entryId,
-        positionMs: 0,
-        effectiveAtWallMs: t,
-        sourceIntentId: intent.id,
-      };
-    }
-
-    case 'skip-previous': {
-      if (!matchesExpectedEntry(prior, intent)) return prior;
-      const prev = neighbor(queue, prior.queueEntryId, -1);
-      if (!prev) return { ...STOPPED, effectiveAtWallMs: t, sourceIntentId: intent.id };
-      return {
-        status: 'playing',
-        queueEntryId: prev.entryId,
-        positionMs: 0,
-        effectiveAtWallMs: t,
-        sourceIntentId: intent.id,
-      };
-    }
+    case 'skip-next':
+    case 'skip-previous':
+      return applyResolvedSkip(prior, intent, queueEntries, t);
 
     case 'stop':
       return { ...STOPPED, effectiveAtWallMs: t, sourceIntentId: intent.id };
   }
+}
+
+function applyResolvedSkip(
+  prior: DerivedPlaybackState,
+  intent: PlaybackIntent,
+  queueEntries: ReadonlySet<string>,
+  atWallMs: number,
+): DerivedPlaybackState {
+  const sourceMatches = matchesExpectedEntry(prior, intent);
+  if (!sourceMatches && prior.queueEntryId) return prior;
+  if (!sourceMatches && intent.queueEntryId) {
+    if (queueEntries.has(intent.queueEntryId)) return prior;
+  }
+
+  const target = intent.targetQueueEntryId;
+  if (!target || !queueEntries.has(target)) {
+    return stoppedAt(atWallMs, intent.id);
+  }
+  return playingAt(target, atWallMs, intent.id);
+}
+
+function playingAt(
+  entryId: string,
+  atWallMs: number,
+  sourceIntentId: string,
+): DerivedPlaybackState {
+  return {
+    status: 'playing',
+    queueEntryId: entryId,
+    positionMs: 0,
+    effectiveAtWallMs: atWallMs,
+    sourceIntentId,
+  };
+}
+
+function stoppedAt(atWallMs: number, sourceIntentId: string): DerivedPlaybackState {
+  return { ...STOPPED, effectiveAtWallMs: atWallMs, sourceIntentId };
 }
 
 function frozenPosition(state: DerivedPlaybackState, atWallMs: number): number {
@@ -153,16 +168,4 @@ function matchesExpectedEntry(
   intent: PlaybackIntent,
 ): boolean {
   return !intent.queueEntryId || prior.queueEntryId === intent.queueEntryId;
-}
-
-function neighbor(
-  queue: readonly QueueEntry[],
-  currentEntryId: string | undefined,
-  direction: 1 | -1,
-): QueueEntry | undefined {
-  if (queue.length === 0) return undefined;
-  if (!currentEntryId) return direction > 0 ? queue[0] : queue[queue.length - 1];
-  const idx = queue.findIndex((e) => e.entryId === currentEntryId);
-  if (idx < 0) return direction > 0 ? queue[0] : queue[queue.length - 1];
-  return queue[idx + direction];
 }

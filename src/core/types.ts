@@ -67,7 +67,11 @@ export type PlaybackIntent = {
   id: IntentId;
   peerId: PeerId;
   kind: PlaybackIntentKind;
+  // Primary entry for this intent. For skip intents this is the source
+  // guard, while targetQueueEntryId below is the resolved destination.
+  // A null target means the skip was resolved at the queue boundary.
   queueEntryId?: QueueEntryId;
+  targetQueueEntryId?: QueueEntryId | null;
   positionMs?: number;
   createdAtWallMs: number;
   localSeq: number;

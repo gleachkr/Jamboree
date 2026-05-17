@@ -229,6 +229,44 @@ describe('JamboreeRoom — convergence (Stage 1 acceptance)', () => {
     expect(a.derivedState()).toEqual(b.derivedState());
   });
 
+  it('removing an entry above the current one does not skip ahead', () => {
+    let now = 1_000;
+    const room = new JamboreeRoom({ now: () => now });
+    const a = addOne(room, 'A');
+    const b = addOne(room, 'B');
+    addOne(room, 'C');
+
+    now = 2_000; room.play();
+    now = 3_000; room.skipNext();
+    expect(room.derivedState()).toMatchObject({
+      status: 'playing',
+      queueEntryId: b.entryId,
+    });
+
+    now = 4_000; room.removeQueueEntry(a.entryId);
+    expect(room.derivedState()).toMatchObject({
+      status: 'playing',
+      queueEntryId: b.entryId,
+      trackId: b.trackId,
+    });
+  });
+
+  it('removing the current entry after a skip stops playback', () => {
+    let now = 1_000;
+    const room = new JamboreeRoom({ now: () => now });
+    addOne(room, 'A');
+    const b = addOne(room, 'B');
+    addOne(room, 'C');
+
+    now = 2_000; room.play();
+    now = 3_000; room.skipNext();
+    expect(room.derivedState().queueEntryId).toBe(b.entryId);
+
+    now = 4_000; room.removeQueueEntry(b.entryId);
+    expect(room.derivedState().status).toBe('stopped');
+    expect(room.derivedState().queueEntryId).toBeUndefined();
+  });
+
   it('deleting the current queue entry yields stopped state', () => {
     let now = 1_000;
     const room = new JamboreeRoom({ now: () => now });
